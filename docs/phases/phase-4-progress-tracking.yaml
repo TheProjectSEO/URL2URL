@@ -1,0 +1,302 @@
+# phase-4-progress-tracking.yaml
+# URL-to-URL Product Matcher - Phase 4 Implementation Guide
+# Priority: MEDIUM | Effort: 2 hours | Depends on: Phase 3
+
+meta:
+  phase: 4
+  name: "Progress Tracking UI"
+  priority: "MEDIUM"
+  effort_hours: 2
+  blocking: false
+  dependencies: ["phase-3"]
+
+objective: |
+  Add real-time progress tracking so users can see job status:
+  - Which stage (crawling, embedding, matching)
+  - How many products processed
+  - Estimated time remaining
+
+progress_stages:
+  - id: "crawling_site_a"
+    label: "Crawling Site A Products"
+    icon: "🔍"
+
+  - id: "crawling_site_b"
+    label: "Crawling Site B Products"
+    icon: "🔍"
+
+  - id: "generating_embeddings"
+    label: "Generating Embeddings"
+    icon: "🧠"
+
+  - id: "matching"
+    label: "Matching Products"
+    icon: "🔗"
+
+  - id: "completed"
+    label: "Completed"
+    icon: "✅"
+
+files_to_create:
+  - path: "apps/api/services/progress.py"
+    action: "CREATE"
+    description: "Progress tracking service"
+    code_structure: |
+      import logging
+      from datetime import datetime
+      from uuid import UUID
+      from typing import Optional
+      from dataclasses import dataclass
+
+      from services.supabase import get_supabase_service
+
+      logger = logging.getLogger(__name__)
+
+      @dataclass
+      class JobProgress:
+          job_id: UUID
+          stage: str
+          current: int
+          total: int
+          rate: float  # items per second
+          eta_seconds: int
+          message: str
+          updated_at: datetime
+
+      class ProgressTracker:
+          """Track and persist job progress."""
+
+          def __init__(self, job_id: UUID):
+              self.job_id = job_id
+              self.supabase = get_supabase_service()
+              self._start_time = None
+              self._items_processed = 0
+
+          async def start(self, stage: str, total: int):
+              """Start tracking a new stage."""
+              self._start_time = datetime.utcnow()
+              self._items_processed = 0
+              await self._update(stage, 0, total, "Starting...")
+
+          async def update(self, current: int, message: str = ""):
+              """Update progress for current stage."""
+              self._items_processed = current
+              elapsed = (datetime.utcnow() - self._start_time).total_seconds()
+              rate = current / elapsed if elapsed > 0 else 0
+              await self._update(self._current_stage, current, self._total, message, rate)
+
+          async def complete(self, stage: str):
+              """Mark stage as complete."""
+              await self._update(stage, self._total, self._total, "Complete")
+
+          async def _update(
+              self,
+              stage: str,
+              current: int,
+              total: int,
+              message: str,
+              rate: float = 0
+          ):
+              self._current_stage = stage
+              self._total = total
+
+              eta = int((total - current) / rate) if rate > 0 else 0
+
+              self.supabase.client.rpc('url_update_progress', {
+                  'p_job_id': str(self.job_id),
+                  'p_stage': stage,
+                  'p_current': current,
+                  'p_total': total,
+                  'p_rate': rate,
+                  'p_eta_seconds': eta,
+                  'p_message': message
+              }).execute()
+
+          @classmethod
+          async def get(cls, job_id: UUID) -> Optional[JobProgress]:
+              """Get current progress for a job."""
+              supabase = get_supabase_service()
+              result = supabase.client.rpc('url_get_progress', {
+                  'p_job_id': str(job_id)
+              }).execute()
+
+              if result.data:
+                  return JobProgress(
+                      job_id=job_id,
+                      stage=result.data['stage'],
+                      current=result.data['current'],
+                      total=result.data['total'],
+                      rate=result.data['rate'],
+                      eta_seconds=result.data['eta_seconds'],
+                      message=result.data['message'],
+                      updated_at=datetime.fromisoformat(result.data['updated_at'])
+                  )
+              return None
+
+  - path: "apps/web/src/components/JobProgress.tsx"
+    action: "CREATE"
+    description: "Real-time progress display component"
+    code_structure: |
+      'use client';
+
+      import { useState, useEffect } from 'react';
+      import { Loader2, CheckCircle2, Clock } from 'lucide-react';
+
+      interface ProgressData {
+        stage: string;
+        current: number;
+        total: number;
+        rate: number;
+        eta_seconds: number;
+        message: string;
+      }
+
+      interface JobProgressProps {
+        jobId: string;
+        onComplete?: () => void;
+      }
+
+      const STAGE_LABELS: Record<string, { label: string; icon: string }> = {
+        crawling_site_a: { label: 'Crawling Site A', icon: '🔍' },
+        crawling_site_b: { label: 'Crawling Site B', icon: '🔍' },
+        generating_embeddings: { label: 'Generating Embeddings', icon: '🧠' },
+        matching: { label: 'Matching Products', icon: '🔗' },
+        completed: { label: 'Completed', icon: '✅' },
+      };
+
+      export function JobProgress({ jobId, onComplete }: JobProgressProps) {
+        const [progress, setProgress] = useState<ProgressData | null>(null);
+        const [isPolling, setIsPolling] = useState(true);
+
+        useEffect(() => {
+          if (!isPolling) return;
+
+          const poll = async () => {
+            try {
+              const res = await fetch(`/api/jobs/${jobId}/progress`);
+              const data = await res.json();
+              setProgress(data);
+
+              if (data.stage === 'completed') {
+                setIsPolling(false);
+                onComplete?.();
+              }
+            } catch (e) {
+              console.error('Progress poll failed:', e);
+            }
+          };
+
+          poll();
+          const interval = setInterval(poll, 2000);
+          return () => clearInterval(interval);
+        }, [jobId, isPolling, onComplete]);
+
+        if (!progress) {
+          return <div className="animate-pulse">Loading progress...</div>;
+        }
+
+        const stageInfo = STAGE_LABELS[progress.stage] || { label: progress.stage, icon: '⏳' };
+        const percentage = progress.total > 0 ? (progress.current / progress.total) * 100 : 0;
+
+        return (
+          <div className="glass-card p-6 space-y-4">
+            <div className="flex items-center gap-3">
+              <span className="text-2xl">{stageInfo.icon}</span>
+              <div className="flex-1">
+                <h3 className="font-semibold">{stageInfo.label}</h3>
+                <p className="text-sm text-muted">{progress.message}</p>
+              </div>
+              {progress.stage !== 'completed' && (
+                <Loader2 className="w-5 h-5 animate-spin text-accent" />
+              )}
+            </div>
+
+            {/* Progress bar */}
+            <div className="relative h-2 bg-surface-2 rounded-full overflow-hidden">
+              <div
+                className="absolute h-full bg-gradient-to-r from-accent to-accent/60 transition-all duration-300"
+                style={{ width: `${percentage}%` }}
+              />
+            </div>
+
+            {/* Stats */}
+            <div className="flex justify-between text-sm">
+              <span>{progress.current} / {progress.total}</span>
+              <span className="flex items-center gap-1">
+                <Clock className="w-4 h-4" />
+                {progress.eta_seconds > 0
+                  ? `~${Math.ceil(progress.eta_seconds / 60)} min remaining`
+                  : 'Calculating...'}
+              </span>
+            </div>
+          </div>
+        );
+      }
+
+files_to_modify:
+  - path: "apps/api/routers/jobs.py"
+    action: "MODIFY"
+    changes:
+      - name: "add_progress_endpoint"
+        code: |
+          @router.get("/{job_id}/progress")
+          async def get_job_progress(job_id: UUID):
+              """Get real-time job progress."""
+              from services.progress import ProgressTracker
+              progress = await ProgressTracker.get(job_id)
+
+              if not progress:
+                  raise HTTPException(404, "Progress not found")
+
+              return {
+                  "stage": progress.stage,
+                  "current": progress.current,
+                  "total": progress.total,
+                  "rate": progress.rate,
+                  "eta_seconds": progress.eta_seconds,
+                  "message": progress.message
+              }
+
+  - path: "apps/api/services/job_runner.py"
+    action: "MODIFY"
+    changes:
+      - name: "integrate_progress_tracker"
+        description: "Update JobRunner to use ProgressTracker"
+
+database_migrations:
+  - name: "create_progress_functions"
+    sql: |
+      CREATE OR REPLACE FUNCTION url_to_url.url_update_progress(
+          p_job_id UUID,
+          p_stage TEXT,
+          p_current INT,
+          p_total INT,
+          p_rate DECIMAL,
+          p_eta_seconds INT,
+          p_message TEXT
+      ) RETURNS void AS $$
+      BEGIN
+          INSERT INTO url_to_url.job_progress (job_id, stage, current_count, total_count, rate, eta_seconds, message, updated_at)
+          VALUES (p_job_id, p_stage, p_current, p_total, p_rate, p_eta_seconds, p_message, now())
+          ON CONFLICT (job_id) DO UPDATE SET
+              stage = EXCLUDED.stage,
+              current_count = EXCLUDED.current_count,
+              total_count = EXCLUDED.total_count,
+              rate = EXCLUDED.rate,
+              eta_seconds = EXCLUDED.eta_seconds,
+              message = EXCLUDED.message,
+              updated_at = now();
+      END;
+      $$ LANGUAGE plpgsql;
+
+validation_checklist:
+  - "[ ] Progress endpoint returns current state"
+  - "[ ] UI polls every 2 seconds"
+  - "[ ] Progress bar animates smoothly"
+  - "[ ] ETA calculation is accurate"
+  - "[ ] Completion triggers callback"
+
+exit_criteria:
+  - Progress visible during job execution
+  - ETA within 20% accuracy
+  - UI updates in real-time

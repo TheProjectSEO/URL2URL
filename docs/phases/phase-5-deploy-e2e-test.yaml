@@ -1,0 +1,164 @@
+# phase-5-deploy-e2e-test.yaml
+# URL-to-URL Product Matcher - Phase 5 Implementation Guide
+# Priority: HIGH | Effort: 2 hours | Depends on: Phase 4
+
+meta:
+  phase: 5
+  name: "Deploy & E2E Testing"
+  priority: "HIGH"
+  effort_hours: 2
+  blocking: false
+  dependencies: ["phase-3", "phase-4"]
+
+objective: |
+  Deploy all changes to production and run comprehensive E2E tests
+  with real Nykaa vs Purplle data to validate 90%+ accuracy.
+
+deployment:
+  backend:
+    platform: "Railway"
+    steps:
+      - "Ensure all environment variables set"
+      - "railway up from apps/api directory"
+      - "Verify health endpoint"
+      - "Check Supabase connection"
+
+    environment_variables:
+      - SUPABASE_URL
+      - SUPABASE_KEY
+      - PYTHON_ENV=production
+      - CORS_ORIGINS
+
+    commands: |
+      cd apps/api
+      railway login --token 3475fb29-620f-4c97-a9f7-6a72376e06ac
+      railway up
+
+      # Verify
+      curl https://product-matcher-production-ef35.up.railway.app/api/health
+
+  frontend:
+    platform: "Vercel or Railway"
+    steps:
+      - "Build Next.js app"
+      - "Deploy to hosting platform"
+      - "Update API_BASE environment variable"
+      - "Verify all pages load"
+
+    commands: |
+      cd apps/web
+      npm run build
+      # Deploy via Vercel CLI or Railway
+
+e2e_test_plan:
+  dataset:
+    site_a:
+      source: "Nykaa"
+      count: 100
+      categories:
+        - "Foundation"
+        - "Lipstick"
+        - "Serum"
+        - "Mascara"
+
+    site_b:
+      source: "Purplle"
+      count: 500
+      note: "Catalog to search against"
+
+  test_execution:
+    - step: 1
+      action: "Create new job via API"
+      expected: "Job created with pending status"
+
+    - step: 2
+      action: "Upload Site A CSV (100 Nykaa products)"
+      expected: "100 products stored"
+
+    - step: 3
+      action: "Upload Site B CSV (500 Purplle products)"
+      expected: "500 products stored"
+
+    - step: 4
+      action: "Start job (POST /api/jobs/{id}/run)"
+      expected: "Job status changes to running"
+
+    - step: 5
+      action: "Monitor progress"
+      expected: "Progress updates every 2 seconds"
+
+    - step: 6
+      action: "Wait for completion"
+      expected: "Job completes within 10 minutes"
+
+    - step: 7
+      action: "Verify matches"
+      expected: "100 match results created"
+
+  accuracy_validation:
+    method: "Manual review of 20 samples"
+    samples:
+      - exact_matches: 5
+      - high_confidence: 5
+      - borderline: 5
+      - no_match: 5
+
+    criteria:
+      - "Exact matches (95%+) are truly identical products"
+      - "High confidence (80-94%) are same product, different listing"
+      - "Borderline (50-79%) are similar but may differ"
+      - "No match (<50%) are correctly unrelated products"
+
+    target_accuracy: "90%+"
+
+  performance_benchmarks:
+    - metric: "100 products processing time"
+      target: "< 5 minutes"
+
+    - metric: "First API response after deploy"
+      target: "< 2 seconds (model preloaded)"
+
+    - metric: "Progress poll latency"
+      target: "< 200ms"
+
+test_commands: |
+  # Create test job
+  JOB_ID=$(curl -X POST https://product-matcher-production-ef35.up.railway.app/api/jobs \
+    -H "Content-Type: application/json" \
+    -d '{"name": "E2E Test", "site_a_url": "https://nykaa.com", "site_b_url": "https://purplle.com"}' \
+    | jq -r '.id')
+
+  # Upload Site A CSV
+  curl -X POST "https://product-matcher-production-ef35.up.railway.app/api/upload/products/$JOB_ID/site_a" \
+    -F "file=@data/nykaa_100.csv"
+
+  # Upload Site B CSV
+  curl -X POST "https://product-matcher-production-ef35.up.railway.app/api/upload/products/$JOB_ID/site_b" \
+    -F "file=@data/purplle_500.csv"
+
+  # Start job
+  curl -X POST "https://product-matcher-production-ef35.up.railway.app/api/jobs/$JOB_ID/run"
+
+  # Poll progress
+  while true; do
+    curl "https://product-matcher-production-ef35.up.railway.app/api/jobs/$JOB_ID/progress"
+    sleep 5
+  done
+
+validation_checklist:
+  - "[ ] Backend deployed to Railway"
+  - "[ ] Health check passes"
+  - "[ ] Frontend deployed"
+  - "[ ] Create job works"
+  - "[ ] CSV upload works"
+  - "[ ] Job runs to completion"
+  - "[ ] Progress tracking works"
+  - "[ ] Match results correct"
+  - "[ ] 90%+ accuracy on test data"
+  - "[ ] Performance within targets"
+
+exit_criteria:
+  - All services deployed and healthy
+  - E2E test passes with 100 products
+  - Accuracy >= 90% on manual review
+  - No critical bugs found

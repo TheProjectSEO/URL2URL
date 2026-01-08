@@ -1,0 +1,148 @@
+# phase-6-optional-enhancements.yaml
+# URL-to-URL Product Matcher - Phase 6 Implementation Guide
+# Priority: LOW | Effort: 4 hours | Depends on: Phase 5
+
+meta:
+  phase: 6
+  name: "Optional Enhancements"
+  priority: "LOW"
+  effort_hours: 4
+  blocking: false
+  dependencies: ["phase-5"]
+
+objective: |
+  Enhance matching accuracy with:
+  1. AI validation for borderline matches (70-90%)
+  2. Image OCR + visual similarity
+
+enhancements:
+  - id: "ai_validation"
+    name: "AI Validation for Borderline Matches"
+    description: |
+      Use Claude/GPT to verify borderline matches (70-90% score).
+      Only ~20% of matches need AI validation.
+
+    when_to_use:
+      - "Match score between 70-90%"
+      - "Brand names differ but products seem similar"
+      - "Titles have different structure"
+
+    skip_for:
+      - "Score >= 95% (clearly exact)"
+      - "Score < 50% (clearly no match)"
+
+    implementation:
+      file: "apps/api/services/ai_validator.py"
+      code_structure: |
+        import anthropic
+        from typing import Tuple
+
+        class AIValidator:
+            def __init__(self):
+                self.client = anthropic.Client()
+
+            async def validate_match(
+                self,
+                source_title: str,
+                source_brand: str,
+                target_title: str,
+                target_brand: str,
+                current_score: float
+            ) -> Tuple[bool, float, str]:
+                """
+                Use AI to validate borderline match.
+                Returns: (is_match, adjusted_score, reasoning)
+                """
+                prompt = f"""You are a product matching expert. Determine if these two products are the same item sold on different e-commerce sites.
+
+Source Product:
+- Title: {source_title}
+- Brand: {source_brand}
+
+Target Product:
+- Title: {target_title}
+- Target Brand: {target_brand}
+
+Current matching score: {current_score:.0%}
+
+Respond in JSON format:
+{{
+  "is_same_product": true/false,
+  "confidence": 0.0-1.0,
+  "reasoning": "Brief explanation"
+}}"""
+
+                response = await self.client.messages.create(
+                    model="claude-3-haiku-20240307",
+                    max_tokens=200,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+
+                # Parse response and return adjusted score
+                result = json.loads(response.content[0].text)
+                adjusted_score = result['confidence'] if result['is_same_product'] else current_score * 0.5
+
+                return result['is_same_product'], adjusted_score, result['reasoning']
+
+    cost_estimate: |
+      - Only 20% of matches need validation
+      - ~100 tokens per validation
+      - Cost: ~$0.01 per 100 products
+
+  - id: "image_ocr"
+    name: "Image OCR + Visual Similarity"
+    description: |
+      Extract text from product images using OCR.
+      Compare visual features using CLIP embeddings.
+
+    implementation:
+      file: "apps/api/services/image_matcher.py"
+      dependencies:
+        - "pytesseract"
+        - "Pillow"
+        - "clip-as-service"
+
+      code_structure: |
+        import pytesseract
+        from PIL import Image
+        import httpx
+        import numpy as np
+
+        class ImageMatcher:
+            def __init__(self):
+                self.ocr_enabled = True
+                self.clip_enabled = True
+
+            async def extract_text_from_image(self, image_url: str) -> str:
+                """Download image and extract text via OCR."""
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(image_url)
+                    img = Image.open(io.BytesIO(response.content))
+                    text = pytesseract.image_to_string(img)
+                    return text.strip()
+
+            async def compute_visual_similarity(
+                self,
+                img_url_1: str,
+                img_url_2: str
+            ) -> float:
+                """Compute CLIP-based visual similarity."""
+                # Implementation with CLIP embeddings
+                # Returns similarity score 0-1
+                pass
+
+    scoring_adjustment: |
+      # Add visual signal to multi-signal scoring
+      Final Score = (0.50 × Semantic) + (0.20 × Token) + (0.15 × Attributes) + (0.15 × Visual)
+
+skip_criteria: |
+  These enhancements are OPTIONAL and should only be implemented if:
+  - Base accuracy is below 90%
+  - Client specifically requests AI validation
+  - Products rely heavily on images for identification
+
+validation_checklist:
+  - "[ ] AI validator reduces false positives"
+  - "[ ] Cost stays under budget"
+  - "[ ] Image OCR extracts readable text"
+  - "[ ] Visual similarity improves accuracy"

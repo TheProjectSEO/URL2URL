@@ -1,0 +1,445 @@
+# phase-2-csv-upload-crawling.yaml
+# URL-to-URL Product Matcher - Phase 2 Implementation Guide
+# Priority: HIGH | Effort: 3 hours | Depends on: Phase 1
+
+meta:
+  phase: 2
+  name: "CSV Upload & Product Crawling"
+  priority: "HIGH"
+  effort_hours: 3
+  blocking: true
+  dependencies: ["phase-1"]
+
+objective: |
+  Enable users to upload CSV files with product URLs for both sites.
+  Backend crawls URLs using Playwright to extract product data.
+  Stores products with metadata ready for embedding generation.
+
+user_workflow:
+  1: "User creates new job via UI"
+  2: "User uploads Site A CSV (their products)"
+  3: "User uploads Site B CSV (competitor products)"
+  4: "System validates CSV format"
+  5: "User clicks 'Start Job'"
+  6: "Backend crawls each URL and extracts product data"
+  7: "Products stored in database with all metadata"
+
+csv_format:
+  required_columns:
+    - url: "Full product URL (https://...)"
+  optional_columns:
+    - title: "Product title (if known)"
+    - brand: "Brand name"
+    - category: "Product category"
+    - price: "Price (numeric)"
+  example: |
+    url,title,brand
+    https://nykaa.com/maybelline-fitme,Maybelline Fit Me Foundation,Maybelline
+    https://nykaa.com/loreal-truematch,L'Oreal True Match,L'Oreal
+
+files_to_create:
+  - path: "apps/api/routers/upload.py"
+    action: "CREATE"
+    description: "CSV upload endpoint"
+    code_structure: |
+      from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+      from fastapi.responses import JSONResponse
+      import csv
+      import io
+      from uuid import UUID
+      from typing import List
+      from pydantic import BaseModel, HttpUrl, validator
+
+      router = APIRouter(prefix="/api/upload", tags=["upload"])
+
+      class CSVUploadResponse(BaseModel):
+          uploaded: int
+          failed: int
+          job_id: str
+          errors: List[str]
+
+      class ProductURL(BaseModel):
+          url: HttpUrl
+          title: str = None
+          brand: str = None
+          category: str = None
+          price: float = None
+
+      @router.post("/products/{job_id}/{site}")
+      async def upload_products_csv(
+          job_id: UUID,
+          site: str,  # "site_a" or "site_b"
+          file: UploadFile = File(...),
+          background_tasks: BackgroundTasks
+      ) -> CSVUploadResponse:
+          """
+          Upload CSV file with product URLs.
+          Validates CSV, stores URLs, triggers crawling.
+          """
+          # Validate site
+          if site not in ["site_a", "site_b"]:
+              raise HTTPException(400, "site must be 'site_a' or 'site_b'")
+
+          # Validate file type
+          if not file.filename.endswith('.csv'):
+              raise HTTPException(400, "File must be CSV")
+
+          # Read and parse CSV
+          content = await file.read()
+          try:
+              reader = csv.DictReader(io.StringIO(content.decode('utf-8')))
+          except Exception as e:
+              raise HTTPException(400, f"Invalid CSV: {e}")
+
+          # Validate and collect URLs
+          urls = []
+          errors = []
+          for i, row in enumerate(reader, start=2):
+              url = row.get('url', '').strip()
+              if not url:
+                  errors.append(f"Row {i}: Missing URL")
+                  continue
+              if not url.startswith('http'):
+                  errors.append(f"Row {i}: Invalid URL format")
+                  continue
+              urls.append(ProductURL(
+                  url=url,
+                  title=row.get('title'),
+                  brand=row.get('brand'),
+                  category=row.get('category'),
+                  price=float(row['price']) if row.get('price') else None
+              ))
+
+          # Store URLs in database (as pending products)
+          supabase = get_supabase_service()
+          uploaded = 0
+          for product_url in urls:
+              try:
+                  await supabase.create_product(ProductCreate(
+                      job_id=job_id,
+                      site=Site(site),
+                      url=str(product_url.url),
+                      title=product_url.title or "Pending crawl",
+                      brand=product_url.brand,
+                      category=product_url.category,
+                      price=product_url.price,
+                      metadata={"crawl_status": "pending"}
+                  ))
+                  uploaded += 1
+              except Exception as e:
+                  errors.append(f"Failed to store {product_url.url}: {e}")
+
+          return CSVUploadResponse(
+              uploaded=uploaded,
+              failed=len(urls) - uploaded,
+              job_id=str(job_id),
+              errors=errors[:10]  # Limit errors
+          )
+
+  - path: "apps/api/services/crawler.py"
+    action: "CREATE"
+    description: "Playwright-based product crawler"
+    code_structure: |
+      import asyncio
+      import logging
+      from dataclasses import dataclass
+      from typing import List, Optional, Dict, Any
+      from urllib.parse import urlparse
+
+      from playwright.async_api import async_playwright, Page, Browser
+
+      logger = logging.getLogger(__name__)
+
+      @dataclass
+      class ProductData:
+          url: str
+          title: str
+          description: str = ""
+          brand: str = ""
+          category: str = ""
+          price: float = None
+          images: List[str] = None
+          metadata: Dict[str, Any] = None
+          success: bool = True
+          error: str = ""
+
+      class ProductCrawler:
+          """Playwright-based product data extractor."""
+
+          def __init__(
+              self,
+              headless: bool = True,
+              timeout: int = 30000,
+              max_concurrent: int = 5
+          ):
+              self.headless = headless
+              self.timeout = timeout
+              self.max_concurrent = max_concurrent
+              self._browser: Optional[Browser] = None
+
+          async def __aenter__(self):
+              self._playwright = await async_playwright().start()
+              self._browser = await self._playwright.chromium.launch(
+                  headless=self.headless,
+                  args=['--no-sandbox', '--disable-dev-shm-usage']
+              )
+              return self
+
+          async def __aexit__(self, *args):
+              if self._browser:
+                  await self._browser.close()
+              if self._playwright:
+                  await self._playwright.stop()
+
+          async def crawl_product(self, url: str) -> ProductData:
+              """Crawl single product URL and extract data."""
+              page = None
+              try:
+                  page = await self._browser.new_page()
+                  page.set_default_timeout(self.timeout)
+
+                  # Add stealth headers
+                  await page.set_extra_http_headers({
+                      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                      'Accept-Language': 'en-US,en;q=0.9'
+                  })
+
+                  await page.goto(url, wait_until='domcontentloaded')
+                  await page.wait_for_timeout(2000)  # Allow JS to render
+
+                  # Extract product data using site-specific selectors
+                  domain = urlparse(url).netloc
+
+                  if 'nykaa.com' in domain:
+                      data = await self._extract_nykaa(page, url)
+                  elif 'purplle.com' in domain:
+                      data = await self._extract_purplle(page, url)
+                  else:
+                      data = await self._extract_generic(page, url)
+
+                  return data
+
+              except Exception as e:
+                  logger.error(f"Crawl failed for {url}: {e}")
+                  return ProductData(url=url, title="", success=False, error=str(e))
+              finally:
+                  if page:
+                      await page.close()
+
+          async def _extract_nykaa(self, page: Page, url: str) -> ProductData:
+              """Extract product data from Nykaa."""
+              title = await page.locator('h1.css-1gc4x7i').first.text_content() or ""
+              brand = await page.locator('a.css-1afod2z').first.text_content() or ""
+
+              price_text = await page.locator('span.css-1jczs19').first.text_content() or "0"
+              price = float(price_text.replace('₹', '').replace(',', '').strip()) if price_text else None
+
+              description = await page.locator('div.product-description').first.text_content() or ""
+
+              images = await page.locator('img.product-image').evaluate_all(
+                  "elements => elements.map(e => e.src)"
+              )
+
+              return ProductData(
+                  url=url,
+                  title=title.strip(),
+                  brand=brand.strip(),
+                  price=price,
+                  description=description[:500],
+                  images=images[:5],
+                  category="Beauty",
+                  metadata={"source": "nykaa"}
+              )
+
+          async def _extract_purplle(self, page: Page, url: str) -> ProductData:
+              """Extract product data from Purplle."""
+              title = await page.locator('h1.product-title').first.text_content() or ""
+              brand = await page.locator('a.brand-name').first.text_content() or ""
+
+              price_text = await page.locator('span.price').first.text_content() or "0"
+              price = float(price_text.replace('₹', '').replace(',', '').strip()) if price_text else None
+
+              return ProductData(
+                  url=url,
+                  title=title.strip(),
+                  brand=brand.strip(),
+                  price=price,
+                  category="Beauty",
+                  metadata={"source": "purplle"}
+              )
+
+          async def _extract_generic(self, page: Page, url: str) -> ProductData:
+              """Generic extractor using common patterns."""
+              # Try common selectors
+              title = ""
+              for selector in ['h1', '[itemprop="name"]', '.product-title', '.product-name']:
+                  try:
+                      title = await page.locator(selector).first.text_content() or ""
+                      if title:
+                          break
+                  except:
+                      continue
+
+              return ProductData(
+                  url=url,
+                  title=title.strip(),
+                  metadata={"source": "generic"}
+              )
+
+          async def crawl_batch(
+              self,
+              urls: List[str],
+              on_progress: callable = None
+          ) -> List[ProductData]:
+              """Crawl multiple URLs with concurrency control."""
+              semaphore = asyncio.Semaphore(self.max_concurrent)
+
+              async def crawl_with_semaphore(url: str, index: int) -> ProductData:
+                  async with semaphore:
+                      result = await self.crawl_product(url)
+                      if on_progress:
+                          on_progress(index + 1, len(urls), url)
+                      return result
+
+              tasks = [crawl_with_semaphore(url, i) for i, url in enumerate(urls)]
+              return await asyncio.gather(*tasks)
+
+files_to_modify:
+  - path: "apps/api/main.py"
+    action: "MODIFY"
+    changes:
+      - name: "include_upload_router"
+        description: "Add upload router to FastAPI app"
+        code: |
+          from routers.upload import router as upload_router
+          app.include_router(upload_router)
+
+  - path: "apps/api/Dockerfile"
+    action: "MODIFY"
+    changes:
+      - name: "add_playwright_dependencies"
+        description: "Install Playwright and Chromium"
+        dockerfile_additions: |
+          # Install Playwright dependencies
+          RUN apt-get update && apt-get install -y \
+              wget \
+              gnupg \
+              libglib2.0-0 \
+              libnss3 \
+              libnspr4 \
+              libatk1.0-0 \
+              libatk-bridge2.0-0 \
+              libcups2 \
+              libdrm2 \
+              libdbus-1-3 \
+              libxkbcommon0 \
+              libxcomposite1 \
+              libxdamage1 \
+              libxfixes3 \
+              libxrandr2 \
+              libgbm1 \
+              libasound2 \
+              && rm -rf /var/lib/apt/lists/*
+
+          # Install Playwright browsers
+          RUN pip install playwright && playwright install chromium
+
+  - path: "apps/api/requirements.txt"
+    action: "MODIFY"
+    changes:
+      - name: "add_playwright"
+        additions:
+          - "playwright>=1.40.0"
+          - "playwright-stealth>=1.0.0"
+
+  - path: "apps/web/src/lib/api.ts"
+    action: "MODIFY"
+    changes:
+      - name: "add_upload_function"
+        code: |
+          export async function uploadProductsCSV(
+            jobId: string,
+            site: 'site_a' | 'site_b',
+            file: File
+          ): Promise<{ uploaded: number; failed: number; errors: string[] }> {
+            const formData = new FormData();
+            formData.append('file', file);
+
+            const response = await fetch(
+              `${API_BASE}/upload/products/${jobId}/${site}`,
+              { method: 'POST', body: formData }
+            );
+
+            if (!response.ok) {
+              throw new Error(`Upload failed: ${response.statusText}`);
+            }
+
+            return response.json();
+          }
+
+  - path: "apps/web/src/app/jobs/new/page.tsx"
+    action: "MODIFY"
+    changes:
+      - name: "add_csv_upload_ui"
+        description: "Add file upload components for Site A and Site B CSVs"
+        ui_components:
+          - "FileDropzone for Site A CSV"
+          - "FileDropzone for Site B CSV"
+          - "CSV validation preview"
+          - "Upload progress indicator"
+          - "Error display for invalid rows"
+
+tests:
+  unit:
+    - name: "test_csv_parsing"
+      description: "Verify CSV parsing with various formats"
+      cases:
+        - "Valid CSV with all columns"
+        - "Valid CSV with only URL column"
+        - "Invalid CSV missing URL"
+        - "Malformed CSV"
+
+    - name: "test_crawler_nykaa"
+      description: "Test Nykaa product extraction"
+      mock: true
+      verify:
+        - "Title extracted correctly"
+        - "Price parsed as float"
+        - "Brand extracted"
+
+    - name: "test_crawler_purplle"
+      description: "Test Purplle product extraction"
+      mock: true
+
+  integration:
+    - name: "test_csv_upload_flow"
+      steps:
+        - "Create job via API"
+        - "Upload Site A CSV (10 products)"
+        - "Verify 10 products in database"
+        - "Upload Site B CSV (50 products)"
+        - "Verify 50 products in database"
+
+    - name: "test_crawler_live"
+      description: "Live crawl test (optional, slow)"
+      urls:
+        - "https://www.nykaa.com/maybelline-fit-me-matte-poreless-liquid-foundation/p/32651"
+        - "https://www.purplle.com/product/maybelline-fit-me-matte-poreless-liquid-foundation"
+
+validation_checklist:
+  - "[ ] CSV upload endpoint accepts files"
+  - "[ ] CSV validation catches malformed data"
+  - "[ ] Products stored in database correctly"
+  - "[ ] Crawler extracts Nykaa products"
+  - "[ ] Crawler extracts Purplle products"
+  - "[ ] Generic extractor works for unknown sites"
+  - "[ ] Frontend shows file upload UI"
+  - "[ ] Upload progress displays correctly"
+  - "[ ] Error messages shown for invalid CSVs"
+  - "[ ] Dockerfile builds with Playwright"
+
+exit_criteria:
+  - POST /api/upload/products/{job_id}/{site} works
+  - CSV with 100 URLs processes in <5 seconds
+  - Crawler extracts product data successfully
+  - Frontend CSV upload functional

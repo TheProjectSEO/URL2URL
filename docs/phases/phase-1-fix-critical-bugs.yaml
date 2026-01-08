@@ -1,0 +1,189 @@
+# phase-1-fix-critical-bugs.yaml
+# URL-to-URL Product Matcher - Phase 1 Implementation Guide
+# Priority: HIGH | Effort: 1 hour | Blocking: All other phases
+
+meta:
+  phase: 1
+  name: "Fix Critical Backend Bugs"
+  priority: "HIGH"
+  effort_hours: 1
+  blocking: true
+  dependencies: []
+
+objective: |
+  Fix missing methods in Supabase service and preload ML model on startup
+  to unblock all API operations and eliminate cold-start latency.
+
+current_state:
+  working:
+    - Supabase client connection
+    - Basic job CRUD (create, read, delete)
+    - Match creation and retrieval
+    - ML matcher service (lazy loading)
+  broken:
+    - update_job() method missing - PUT /api/jobs/{id} will fail
+    - update_matches_bulk() method missing - bulk approve/reject fails
+    - get_products_by_site() method missing - needed for vector indexing
+    - Model loads lazily - first request takes 10-15s
+
+files_to_modify:
+  - path: "apps/api/services/supabase.py"
+    action: "MODIFY"
+    changes:
+      - name: "add_update_job_method"
+        description: "Add update_job() method for updating job fields"
+        code_template: |
+          async def update_job(self, job_id: UUID, update: CrawlJobUpdate) -> Optional[CrawlJob]:
+              """Update job fields (name, config, etc.)."""
+              try:
+                  result = self.client.rpc('url_update_job', {
+                      'p_job_id': str(job_id),
+                      'p_name': update.name,
+                      'p_categories': update.categories,
+                      'p_config': update.config.model_dump() if update.config else None
+                  }).execute()
+                  if result.data:
+                      return self._parse_job(result.data)
+                  return None
+              except Exception as e:
+                  logger.error(f"Error updating job: {e}")
+                  return None
+
+      - name: "add_update_matches_bulk_method"
+        description: "Add bulk update for match status (approve/reject)"
+        code_template: |
+          async def update_matches_bulk(
+              self,
+              match_ids: List[UUID],
+              status: MatchStatus
+          ) -> int:
+              """Bulk update match status. Returns count of updated matches."""
+              try:
+                  updated = 0
+                  for match_id in match_ids:
+                      result = self.client.rpc('url_update_match_status', {
+                          'p_match_id': str(match_id),
+                          'p_status': status.value
+                      }).execute()
+                      if result.data:
+                          updated += 1
+                  return updated
+              except Exception as e:
+                  logger.error(f"Error bulk updating matches: {e}")
+                  return 0
+
+      - name: "add_get_products_by_site_method"
+        description: "Fetch products by job and site for vector indexing"
+        code_template: |
+          async def get_products_by_site(
+              self,
+              job_id: UUID,
+              site: Site,
+              with_embeddings: bool = False
+          ) -> List[Product]:
+              """Get products by site for vector operations."""
+              try:
+                  result = self.client.rpc('url_get_products_by_job', {
+                      'p_job_id': str(job_id),
+                      'p_site': site.value
+                  }).execute()
+                  return [self._parse_product(p) for p in result.data] if result.data else []
+              except Exception as e:
+                  logger.error(f"Error fetching products by site: {e}")
+                  return []
+
+  - path: "apps/api/main.py"
+    action: "MODIFY"
+    changes:
+      - name: "preload_ml_model_on_startup"
+        description: "Load sentence-transformers model during app startup"
+        location: "lifespan function, after Supabase check"
+        code_template: |
+          # In lifespan function, after Supabase key check:
+
+          # Preload ML model (avoids 10-15s cold start)
+          logger.info("Preloading ML model...")
+          try:
+              from services.matcher import get_matcher_service
+              matcher = get_matcher_service()
+              matcher._ensure_loaded()
+              logger.info("ML model preloaded successfully")
+          except Exception as e:
+              logger.warning(f"Failed to preload ML model: {e}")
+
+database_migrations:
+  - name: "url_update_job_rpc"
+    description: "RPC function to update job fields"
+    sql: |
+      CREATE OR REPLACE FUNCTION url_to_url.url_update_job(
+          p_job_id UUID,
+          p_name TEXT DEFAULT NULL,
+          p_categories JSONB DEFAULT NULL,
+          p_config JSONB DEFAULT NULL
+      ) RETURNS url_to_url.crawl_jobs AS $$
+      DECLARE
+          v_result url_to_url.crawl_jobs;
+      BEGIN
+          UPDATE url_to_url.crawl_jobs
+          SET
+              name = COALESCE(p_name, name),
+              categories = COALESCE(p_categories, categories),
+              config = COALESCE(p_config, config)
+          WHERE id = p_job_id
+          RETURNING * INTO v_result;
+
+          RETURN v_result;
+      END;
+      $$ LANGUAGE plpgsql SECURITY DEFINER;
+
+tests:
+  unit:
+    - name: "test_update_job"
+      description: "Verify job update persists changes"
+      steps:
+        - Create job with initial values
+        - Call update_job with new name
+        - Verify job has new name
+
+    - name: "test_update_matches_bulk"
+      description: "Verify bulk match status update"
+      steps:
+        - Create job with 5 pending matches
+        - Call update_matches_bulk with approved status
+        - Verify all 5 matches are approved
+
+    - name: "test_model_preload"
+      description: "Verify model loads on startup"
+      steps:
+        - Start application
+        - Check logs for "ML model preloaded"
+        - Make first API call, verify no cold start delay
+
+  integration:
+    - name: "test_job_update_api"
+      command: |
+        curl -X PUT http://localhost:8000/api/jobs/{job_id} \
+          -H "Content-Type: application/json" \
+          -d '{"name": "Updated Job Name"}'
+      expected: "200 OK with updated job data"
+
+validation_checklist:
+  - "[ ] update_job() method added and working"
+  - "[ ] update_matches_bulk() method added and working"
+  - "[ ] get_products_by_site() method added and working"
+  - "[ ] ML model preloads on startup"
+  - "[ ] First API call has no cold start delay (<1s response)"
+  - "[ ] All existing tests still pass"
+  - "[ ] PUT /api/jobs/{id} endpoint works"
+
+exit_criteria:
+  - All Supabase methods implemented
+  - Model loads during startup (check logs)
+  - PUT /api/jobs/{id} returns 200
+  - First /api/jobs GET completes in <1s
+
+rollback_plan: |
+  If issues arise:
+  1. Revert supabase.py changes (git checkout)
+  2. Remove model preload from main.py
+  3. Lazy loading will still work as fallback

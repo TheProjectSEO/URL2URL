@@ -1,0 +1,53 @@
+# Environment variables - NEVER commit secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Output files
+output/
+results/
+*.csv
+!data/sample_*.csv
+
+# Logs
+*.log
+*.txt
+!requirements.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model cache (ML model files at root level, not Python packages)
+.cache/
+/models/
+!/apps/api/models/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/

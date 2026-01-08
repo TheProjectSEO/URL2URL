@@ -1,0 +1,305 @@
+Yes. For a first test, skip n8n, skip CLI, use two CSVs and one Python script that outputs a third CSV with:
+	•	best match URL
+	•	confidence bucket (100/90/80/…)
+	•	raw score
+	•	“why not 100%” (grounded on detected diffs)
+	•	top 5 candidates
+
+What you need in the two CSVs
+
+Create:
+	•	site_a.csv
+	•	site_b.csv
+
+Minimum columns (keep names exactly like this to reduce friction):
+	•	url
+	•	title
+	•	h1
+	•	breadcrumbs (optional)
+	•	body_text (optional but helps a lot)
+	•	sku (optional)
+	•	mpn (optional)
+	•	gtin (optional)
+	•	upc (optional)
+
+If you don’t have body_text yet, you can still test with title + h1 + breadcrumbs.
+
+Install deps
+
+pip install pandas numpy scikit-learn sentence-transformers
+
+One-file Python test script
+
+Save as url_mapper_test.py:
+
+import re
+import json
+import argparse
+import numpy as np
+import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
+
+# --- Helpers ---
+def norm_text(s: str) -> str:
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return ""
+    s = str(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def norm_id(s: str) -> str:
+    s = norm_text(s).upper()
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    return s
+
+def tokenize(s: str):
+    s = norm_text(s).lower()
+    # keep alphanum chunks incl model-like tokens (e.g., a52s, sm-g991b)
+    return re.findall(r"[a-z0-9]+(?:[-_/][a-z0-9]+)*", s)
+
+def jaccard(a, b) -> float:
+    sa, sb = set(a), set(b)
+    if not sa and not sb:
+        return 0.0
+    return len(sa & sb) / max(1, len(sa | sb))
+
+def extract_attributes(text: str) -> dict:
+    """
+    Generic, low-risk attribute extraction that helps with phone/laptop/electronics/apparel.
+    Extend later per niche.
+    """
+    t = norm_text(text).lower()
+
+    attrs = {}
+
+    # storage/capacity (e.g., 128gb, 1tb)
+    m = re.findall(r"\b(\d{1,4})\s?(gb|tb)\b", t)
+    if m:
+        # take the first as primary
+        attrs["capacity"] = f"{m[0][0]}{m[0][1]}"
+
+    # size in inches (e.g., 6.1", 15-inch)
+    m = re.findall(r"\b(\d{1,2}(?:\.\d)?)\s?(?:inches|inch|in|\"|\”)\b", t)
+    if m:
+        attrs["size_in"] = m[0]
+
+    # pack size (e.g., pack of 2, 2-pack)
+    m = re.findall(r"\b(?:pack of|pack)\s?(\d{1,3})\b|\b(\d{1,3})-pack\b", t)
+    if m:
+        # m is list of tuples
+        for a, b in m:
+            if a or b:
+                attrs["pack"] = a or b
+                break
+
+    # colors (very rough; good enough for MVP test)
+    colors = ["black","white","blue","red","green","pink","purple","silver","gold","gray","grey","yellow","orange","beige","brown"]
+    for c in colors:
+        if re.search(rf"\b{c}\b", t):
+            attrs["color"] = c
+            break
+
+    return attrs
+
+def build_summary(row: pd.Series) -> str:
+    parts = [
+        norm_text(row.get("title", "")),
+        norm_text(row.get("h1", "")),
+        norm_text(row.get("breadcrumbs", "")),
+        norm_text(row.get("body_text", ""))[:1500],  # cap to keep it light
+    ]
+    # remove empties
+    parts = [p for p in parts if p]
+    return " | ".join(parts)
+
+def confidence_bucket(score: float) -> int:
+    # simple buckets for test run; tune later
+    if score >= 0.95: return 100
+    if score >= 0.90: return 90
+    if score >= 0.82: return 80
+    if score >= 0.74: return 70
+    if score >= 0.66: return 60
+    if score >= 0.58: return 50
+    return 0
+
+def why_not_100(a_row, b_row, diffs: list[str]) -> str:
+    if not diffs:
+        return ""
+    # keep it one line, grounded
+    return "; ".join(diffs[:2])  # max 2 reasons for MVP clarity
+
+def compute_diff_notes(a, b, a_attrs, b_attrs):
+    diffs = []
+
+    # IDs
+    a_ids = {k: norm_id(a.get(k, "")) for k in ["gtin","upc","mpn","sku"]}
+    b_ids = {k: norm_id(b.get(k, "")) for k in ["gtin","upc","mpn","sku"]}
+
+    shared_id = False
+    for k in ["gtin","upc","mpn","sku"]:
+        if a_ids[k] and b_ids[k] and a_ids[k] == b_ids[k]:
+            shared_id = True
+            break
+    if not shared_id:
+        # only note if both sides lack a shared ID
+        diffs.append("no shared identifier (GTIN/UPC/MPN/SKU)")
+
+    # capacity, size, pack, color
+    for key in ["capacity","size_in","pack","color"]:
+        av = a_attrs.get(key)
+        bv = b_attrs.get(key)
+        if av and bv and av != bv:
+            diffs.append(f"{key} differs ({av} vs {bv})")
+
+    return diffs
+
+# --- Main matching ---
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--a", required=True, help="CSV for site A")
+    ap.add_argument("--b", required=True, help="CSV for site B")
+    ap.add_argument("--top_k", type=int, default=25, help="candidates to consider per URL (MVP)")
+    ap.add_argument("--out", default="matches.csv", help="output CSV path")
+    args = ap.parse_args()
+
+    df_a = pd.read_csv(args.a)
+    df_b = pd.read_csv(args.b)
+
+    # ensure columns exist
+    for col in ["url","title","h1","breadcrumbs","body_text","sku","mpn","gtin","upc"]:
+        if col not in df_a.columns: df_a[col] = ""
+        if col not in df_b.columns: df_b[col] = ""
+
+    # build summaries + attributes
+    df_a["summary"] = df_a.apply(build_summary, axis=1)
+    df_b["summary"] = df_b.apply(build_summary, axis=1)
+
+    df_a["attrs"] = df_a["summary"].apply(extract_attributes)
+    df_b["attrs"] = df_b["summary"].apply(extract_attributes)
+
+    # token sets for brand/model-ish overlap
+    df_a["tok"] = df_a["summary"].apply(tokenize)
+    df_b["tok"] = df_b["summary"].apply(tokenize)
+
+    # embeddings (fast MVP)
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        raise SystemExit("Install sentence-transformers: pip install sentence-transformers")
+
+    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+    emb_a = model.encode(df_a["summary"].tolist(), normalize_embeddings=True, show_progress_bar=True)
+    emb_b = model.encode(df_b["summary"].tolist(), normalize_embeddings=True, show_progress_bar=True)
+
+    # cosine sim matrix for MVP (fine for small tests; switch to FAISS for big)
+    sim = cosine_similarity(emb_a, emb_b)  # shape (len(a), len(b))
+
+    rows = []
+    for i, a in df_a.iterrows():
+        # top K candidates by semantic similarity
+        cand_idx = np.argsort(-sim[i])[:args.top_k]
+
+        best = None
+        best_score = -1.0
+        best_notes = ""
+        best_raw = {}
+
+        a_ids = {k: norm_id(a.get(k, "")) for k in ["gtin","upc","mpn","sku"]}
+        a_attrs = a["attrs"]
+        a_tok = a["tok"]
+
+        top_candidates = []
+
+        for j in cand_idx:
+            b = df_b.iloc[j]
+            b_ids = {k: norm_id(b.get(k, "")) for k in ["gtin","upc","mpn","sku"]}
+            b_attrs = b["attrs"]
+            b_tok = b["tok"]
+
+            # hard ID match
+            id_match = 0.0
+            for k in ["gtin","upc","mpn","sku"]:
+                if a_ids[k] and b_ids[k] and a_ids[k] == b_ids[k]:
+                    id_match = 1.0
+                    break
+
+            s_sem = float(sim[i, j])  # already 0..1 due to normalized embeddings
+            s_tok = jaccard(a_tok, b_tok)
+
+            # attribute overlap score
+            keys = set(a_attrs.keys()) | set(b_attrs.keys())
+            if not keys:
+                s_attr = 0.0
+            else:
+                same = 0
+                comparable = 0
+                for k in keys:
+                    av = a_attrs.get(k)
+                    bv = b_attrs.get(k)
+                    if av and bv:
+                        comparable += 1
+                        if av == bv:
+                            same += 1
+                s_attr = (same / comparable) if comparable else 0.0
+
+            # combine (simple MVP weights)
+            if id_match == 1.0:
+                score = 1.0
+            else:
+                score = 0.60 * s_sem + 0.25 * s_tok + 0.15 * s_attr
+
+            diffs = compute_diff_notes(a, b, a_attrs, b_attrs)
+            note = why_not_100(a, b, diffs) if score < 0.999 else ""
+
+            top_candidates.append({
+                "url": b["url"],
+                "score": round(score, 4),
+                "note": note
+            })
+
+            if score > best_score:
+                best_score = score
+                best = b["url"]
+                best_notes = note
+                best_raw = {
+                    "semantic": round(s_sem, 4),
+                    "token": round(s_tok, 4),
+                    "attr": round(s_attr, 4),
+                    "id_match": int(id_match),
+                }
+
+        rows.append({
+            "source_url": a["url"],
+            "best_match_url": best,
+            "confidence_bucket": confidence_bucket(best_score),
+            "raw_score": round(best_score, 4),
+            "why_not_100": best_notes,
+            "score_breakdown": json.dumps(best_raw, ensure_ascii=False),
+            "top5": json.dumps(top_candidates[:5], ensure_ascii=False),
+        })
+
+    out = pd.DataFrame(rows)
+    out.to_csv(args.out, index=False)
+    print(f"Wrote: {args.out}")
+
+if __name__ == "__main__":
+    main()
+
+Run it
+
+python url_mapper_test.py --a site_a.csv --b site_b.csv --top_k 25 --out matches.csv
+
+What this MVP proves
+	•	End-to-end flow works using only CSVs
+	•	Semantic matching is doing the heavy lifting (embeddings)
+	•	“Why not 100%” is consistent and based on concrete diffs
+	•	You get top candidates for manual QA
+
+When you’re happy with the flow
+
+Two quick upgrades (still pure Python):
+	1.	Replace cosine matrix with FAISS once site B grows (so memory stays stable).
+	2.	Improve attribute extraction per niche (electronics vs fashion vs home goods).
+
+If you paste the exact column headers you can export today (even if messy), I’ll adjust the script to match your current CSV format so you can run it as-is.
