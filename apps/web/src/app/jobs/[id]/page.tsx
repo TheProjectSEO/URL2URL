@@ -17,10 +17,11 @@ import {
   Clock,
   Loader2
 } from 'lucide-react';
-import { api, type Job, type Match } from '@/lib/api';
+import { api, type Job, type Match, type CSVUploadResponse } from '@/lib/api';
 import { formatRelativeTime } from '@/lib/utils';
 import ProgressBar from '@/components/ProgressBar';
 import MatchTable from '@/components/MatchTable';
+import { CSVUploader } from '@/components/CSVUploader';
 
 // Get status badge class
 function getStatusBadgeClass(status: string): string {
@@ -271,6 +272,46 @@ export default function JobDetailsPage() {
               </div>
             </div>
           </div>
+
+          {/* CSV Upload Section (if pending) */}
+          {job.status === 'pending' && (
+            <div className="glass-card p-6 space-y-6">
+              <div>
+                <h2 className="text-lg font-semibold text-[rgb(var(--text-primary))] mb-2">
+                  Upload Product Data
+                </h2>
+                <p className="text-sm text-[rgb(var(--text-muted))]">
+                  Upload CSV files containing product URLs for both sites. The system will crawl each URL to extract product data for matching.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {/* Site A (Source) Upload */}
+                <CSVUploader
+                  jobId={jobId}
+                  site="site_a"
+                  label="Source Products (Site A)"
+                  description="Upload your products that need to be matched"
+                  onUploadComplete={(result) => {
+                    console.log('Site A upload complete:', result);
+                    fetchJobData();
+                  }}
+                />
+
+                {/* Site B (Target) Upload */}
+                <CSVUploader
+                  jobId={jobId}
+                  site="site_b"
+                  label="Target Catalog (Site B)"
+                  description="Upload competitor products to match against"
+                  onUploadComplete={(result) => {
+                    console.log('Site B upload complete:', result);
+                    fetchJobData();
+                  }}
+                />
+              </div>
+            </div>
+          )}
 
           {/* Progress (if running) */}
           {job.status === 'running' && (

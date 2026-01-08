@@ -90,6 +90,13 @@ export interface JobStats {
   approved_matches: number;
 }
 
+export interface CSVUploadResponse {
+  uploaded: number;
+  failed: number;
+  job_id: string;
+  errors: string[];
+}
+
 const handleResponse = async (response: Response) => {
   if (!response.ok) {
     const error = await response.json().catch(() => ({ detail: 'An error occurred' }));
@@ -178,6 +185,33 @@ export const api = {
   stats: {
     get: async (): Promise<JobStats> => {
       const response = await fetch(`${API_URL}/api/stats`);
+      return handleResponse(response);
+    },
+  },
+
+  upload: {
+    /**
+     * Upload CSV file with product URLs for a job.
+     * @param jobId - The job ID to add products to
+     * @param site - Either "site_a" (source products) or "site_b" (catalog to match against)
+     * @param file - CSV file with at least a 'url' column
+     */
+    csv: async (jobId: string, site: 'site_a' | 'site_b', file: File): Promise<CSVUploadResponse> => {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const response = await fetch(`${API_URL}/api/upload/products/${jobId}/${site}`, {
+        method: 'POST',
+        body: formData,
+      });
+      return handleResponse(response);
+    },
+
+    /**
+     * Get CSV template format information
+     */
+    getTemplate: async (): Promise<{ format: string; required_columns: string[]; optional_columns: string[]; example: string }> => {
+      const response = await fetch(`${API_URL}/api/upload/template`);
       return handleResponse(response);
     },
   },
