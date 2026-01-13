@@ -42,6 +42,7 @@ class MatcherConfig:
     enable_ai_validation: bool = False
     ai_validation_min_score: float = 0.70
     ai_validation_max_score: float = 0.94
+    max_ai_validations_per_job: int = 100
 
     # Image matching settings
     enable_image_matching: bool = False
@@ -53,6 +54,9 @@ class MatcherConfig:
     token_weight: float = 0.25
     attribute_weight: float = 0.15
     visual_weight: float = 0.0  # Set to 0.15 when image matching enabled
+    # Text matching enhancements
+    embed_enriched_text: bool = False
+    token_norm_v2: bool = False
 
 
 @dataclass
@@ -156,6 +160,9 @@ class MultiCandidateMatcher:
         self._ai_validator: Optional[AIValidator] = None
         self._image_matcher: Optional[ImageMatcher] = None
 
+        # Per-job AI validation counter
+        self._ai_validations_used: int = 0
+
         if self.config.enable_ai_validation:
             self._ai_validator = get_ai_validator(enabled=True)
             logger.info("AI validation enabled for borderline matches (70-94%)")
@@ -180,8 +187,31 @@ class MultiCandidateMatcher:
             "ai_confirmed": 0,
             "ai_rejected": 0,
             "ai_score_adjustments": 0,
-            "image_comparisons": 0
+            "image_comparisons": 0,
+            "alias_hits": 0,
+            "synonym_hits": 0,
+            "variant_hits": 0
         }
+        self._image_comparisons_used = 0
+
+        # Load ontologies if enabled
+        if getattr(self.config, 'use_brand_ontology', False) or getattr(self.config, 'use_category_ontology', False):
+            try:
+                import json, os
+                base = os.path.dirname(os.path.abspath(__file__))
+                root = os.path.abspath(os.path.join(base, '..'))
+                if getattr(self.config, 'use_brand_ontology', False):
+                    with open(os.path.join(root, 'ontologies', 'brand_aliases.json'), 'r') as f:
+                        self._brand_aliases = json.load(f)
+                else:
+                    self._brand_aliases = {}
+                if getattr(self.config, 'use_category_ontology', False):
+                    with open(os.path.join(root, 'ontologies', 'category_synonyms.json'), 'r') as f:
+                        self._category_synonyms = json.load(f)
+                else:
+                    self._category_synonyms = {}
+            except Exception as e:
+                logger.warning(f"Failed to load ontologies: {e}")
 
         logger.info(f"MultiCandidateMatcher initialized with model: {model_name}")
 
@@ -206,6 +236,18 @@ class MultiCandidateMatcher:
             show_progress_bar=False
         )
 
+    def _compose_text(self, p: Product) -> str:
+        """Compose text for embeddings based on config (enriched vs title-only)."""
+        if self.config and getattr(self.config, 'embed_enriched_text', False):
+            parts = [p.title or ""]
+            if p.brand:
+                parts.append(p.brand)
+            if p.category:
+                parts.append(p.category)
+            # Variant text will be added in a later step
+            return " ".join(parts).strip()
+        return p.title
+
     async def generate_embeddings_batch(
         self,
         products: List[Product]
@@ -214,7 +256,7 @@ class MultiCandidateMatcher:
         if not products:
             return {}
 
-        texts = [p.title for p in products]
+        texts = [self._compose_text(p) for p in products]
         embeddings = self.model.encode(
             texts,
             normalize_embeddings=True,
@@ -283,7 +325,7 @@ class MultiCandidateMatcher:
         self.metrics["total_matches"] += 1
 
         # Generate embedding for source product
-        source_embedding = self.generate_embedding(source.title)
+        source_embedding = self.generate_embedding(self._compose_text(source))
 
         # pgvector search for top candidates
         candidates = await self.search_candidates(
@@ -306,20 +348,24 @@ class MultiCandidateMatcher:
         for row, semantic_sim in candidates:
             # Phase 6: Get image similarity if enabled
             visual_sim = None
-            if self._image_matcher and self._image_matcher.is_available:
-                source_image = getattr(source, 'image_url', None) or source.metadata.get('image_url', '') if hasattr(source, 'metadata') else ''
-                target_image = row.get('image_url') or row.get('metadata', {}).get('image_url', '')
+            if self._image_matcher and self._image_matcher.is_available and getattr(self.config, 'use_ocr_text', False):
+                # Respect per-job OCR cap
+                cap = max(0, int(getattr(self.config, 'max_image_comparisons_per_job', 500)))
+                if self._image_comparisons_used < cap:
+                    source_image = getattr(source, 'image_url', None) or source.metadata.get('image_url', '') if hasattr(source, 'metadata') else ''
+                    target_image = row.get('image_url') or row.get('metadata', {}).get('image_url', '')
 
-                if source_image and target_image:
-                    try:
-                        image_result = await self._image_matcher.compare_images(
-                            source_image, target_image
-                        )
-                        if image_result.success:
-                            visual_sim = image_result.combined_score
-                            self.metrics["image_comparisons"] += 1
-                    except Exception as e:
-                        logger.warning(f"Image comparison failed: {e}")
+                    if source_image and target_image:
+                        try:
+                            image_result = await self._image_matcher.compare_images(
+                                source_image, target_image
+                            )
+                            if image_result.success:
+                                visual_sim = image_result.combined_score
+                                self.metrics["image_comparisons"] += 1
+                                self._image_comparisons_used += 1
+                        except Exception as e:
+                            logger.warning(f"Image comparison failed: {e}")
 
             score = self._compute_multi_signal_score(
                 source, row, semantic_sim, visual_sim
@@ -361,6 +407,8 @@ class MultiCandidateMatcher:
         if self._should_ai_validate(best.score):
             ai_response = await self._run_ai_validation(source, best)
             if ai_response and ai_response.result != ValidationResultType.SKIPPED:
+                # Count a used validation for this job instance
+                self._ai_validations_used += 1
                 ai_validated = True
                 ai_validation_result = ai_response.result.value
                 self.metrics["ai_validations"] += 1
@@ -423,8 +471,13 @@ class MultiCandidateMatcher:
         if not self._ai_validator or not self.config.enable_ai_validation:
             return False
 
+        # Respect per-job validation cap
+        if self._ai_validations_used >= max(0, int(self.config.max_ai_validations_per_job)):
+            return False
+
+        # Use configured min/max range
         return (
-            self.AI_VALIDATION_MIN_SCORE <= score <= self.AI_VALIDATION_MAX_SCORE
+            self.config.ai_validation_min_score <= score <= self.config.ai_validation_max_score
         )
 
     async def _run_ai_validation(
@@ -503,8 +556,8 @@ class MultiCandidateMatcher:
         semantic_score = semantic_sim * self.SEMANTIC_WEIGHT
 
         # Token overlap - Jaccard similarity
-        source_tokens = set(source.title.lower().split())
-        target_tokens = set(target.get('title', '').lower().split())
+        source_tokens = self._tokenize_text(source.title)
+        target_tokens = self._tokenize_text(target.get('title', ''))
         intersection = len(source_tokens & target_tokens)
         union = len(source_tokens | target_tokens)
         token_score = (intersection / union if union else 0) * self.TOKEN_WEIGHT
@@ -517,32 +570,76 @@ class MultiCandidateMatcher:
         if visual_sim is not None and self.VISUAL_WEIGHT > 0:
             visual_score = visual_sim * self.VISUAL_WEIGHT
 
-        return semantic_score + token_score + attr_score + visual_score
+        combined = semantic_score + token_score + attr_score + visual_score
+        # Brand mismatch penalty when ontologies enabled and brands differ
+        if self.config and getattr(self.config, 'use_brand_ontology', False):
+            sb = self._canonicalize_brand((source.brand or '').strip()) if hasattr(self, '_canonicalize_brand') else (source.brand or '').strip().lower()
+            tb = self._canonicalize_brand((target.get('brand') or '').strip()) if hasattr(self, '_canonicalize_brand') else (target.get('brand') or '').strip().lower()
+            if sb and tb and sb != tb:
+                combined = max(0.0, combined - 0.05)
+        return combined
 
     def _attribute_match(self, source: Product, target: dict) -> float:
-        """Compare product attributes (brand, category)."""
+        """Compare product attributes (brand, category, and optional variants)."""
         score = 0.0
         checks = 0
 
-        source_brand = (source.brand or "").lower().strip()
-        target_brand = (target.get('brand') or "").lower().strip()
+        # Brand (with optional ontology)
+        src_brand = (source.brand or "").strip()
+        tgt_brand = (target.get('brand') or "").strip()
+        src_brand_c = self._canonicalize_brand(src_brand) if hasattr(self, '_canonicalize_brand') else src_brand.lower()
+        tgt_brand_c = self._canonicalize_brand(tgt_brand) if hasattr(self, '_canonicalize_brand') else tgt_brand.lower()
 
-        if source_brand and target_brand:
+        if src_brand_c and tgt_brand_c:
             checks += 1
-            if source_brand == target_brand:
+            if src_brand_c == tgt_brand_c:
                 score += 1.0
-            elif source_brand in target_brand or target_brand in source_brand:
+            elif src_brand_c in tgt_brand_c or tgt_brand_c in src_brand_c:
                 score += 0.5
 
-        source_cat = (source.category or "").lower().strip()
-        target_cat = (target.get('category') or "").lower().strip()
-
-        if source_cat and target_cat:
+        # Category (with optional ontology)
+        src_cat = (source.category or "").lower().strip()
+        tgt_cat = (target.get('category') or "").lower().strip()
+        if src_cat and tgt_cat:
             checks += 1
-            if source_cat == target_cat:
+            if src_cat == tgt_cat:
                 score += 1.0
+            elif hasattr(self, '_categories_related') and self._categories_related(src_cat, tgt_cat):
+                score += 0.5
+
+        # Variants (optional)
+        if self.config and getattr(self.config, 'use_variant_extractor', False):
+            src_var = self._extract_variants(source.title) if hasattr(self, '_extract_variants') else {}
+            tgt_var = self._extract_variants(target.get('title', '')) if hasattr(self, '_extract_variants') else {}
+            var_score = self._compare_variants(src_var, tgt_var) if hasattr(self, '_compare_variants') else None
+            if var_score is not None:
+                checks += 1
+                score += var_score
 
         return score / checks if checks else 0.0
+
+    def _tokenize_text(self, text: str) -> set:
+        """Tokenize text with optional normalization v2."""
+        if not text:
+            return set()
+        raw = text.lower().strip()
+        if not (self.config and getattr(self.config, 'token_norm_v2', False)):
+            return set(raw.split())
+        import re
+        # Insert spaces before camelCase / digits boundaries (very light heuristic)
+        raw = re.sub(r'([a-z])([A-Z0-9])', r'\1 \2', raw)
+        raw = re.sub(r'([0-9])([a-zA-Z])', r'\1 \2', raw)
+        # Replace non-alphanumeric with spaces
+        raw = re.sub(r'[^a-z0-9]+', ' ', raw)
+        # Collapse spaces
+        raw = re.sub(r'\s+', ' ', raw).strip()
+        tokens = set(raw.split())
+        stop = {
+            'the','a','an','and','or','for','with','by','of','to','on','in',
+            'ml','g','gm','kg','oz','fl','pack','pcs','set','new','free','best',
+            'sale','off','price'
+        }
+        return {t for t in tokens if t not in stop and len(t) >= 2}
 
     def _get_confidence_tier(self, score: float) -> ConfidenceTier:
         """Map score to confidence tier."""
@@ -581,6 +678,97 @@ class MultiCandidateMatcher:
             reasons.append(f"Score: {best.score:.0%}")
 
         return "; ".join(reasons) if reasons else "Minor variations detected"
+
+    # ===== Ontology helpers =====
+    def _canonicalize_brand(self, brand: str) -> str:
+        b = (brand or '').lower().strip()
+        if not b or not hasattr(self, '_brand_aliases'):
+            return b
+        # Exact canonical key
+        if b in self._brand_aliases:
+            self.metrics["alias_hits"] += 1
+            return b
+        for canon, aliases in self._brand_aliases.items():
+            if b == canon or b in aliases:
+                self.metrics["alias_hits"] += 1
+                return canon
+        return b
+
+    def _categories_related(self, s: str, t: str) -> bool:
+        if not hasattr(self, '_category_synonyms'):
+            return False
+        s = (s or '').lower().strip()
+        t = (t or '').lower().strip()
+        if s == t:
+            return True
+        syns = self._category_synonyms or {}
+        if s in syns and t in syns[s]:
+            self.metrics["synonym_hits"] += 1
+            return True
+        if t in syns and s in syns[t]:
+            self.metrics["synonym_hits"] += 1
+            return True
+        return False
+
+    def _extract_variants(self, text: str) -> dict:
+        import re
+        out = {"size_ml": None, "weight_g": None, "pack": None, "shade": None, "model": None}
+        if not text:
+            return out
+        s = text.lower()
+        m = re.search(r"(pack|set)\s*of\s*(\d+)", s)
+        if m:
+            out["pack"] = int(m.group(2))
+        m = re.search(r"(\d+\.?\d*)\s*(ml|l)\b", s)
+        if m:
+            val = float(m.group(1)); unit = m.group(2)
+            out["size_ml"] = val * 1000.0 if unit == 'l' else val
+        m = re.search(r"(\d+\.?\d*)\s*(g|kg)\b", s)
+        if m:
+            val = float(m.group(1)); unit = m.group(2)
+            out["weight_g"] = val * 1000.0 if unit == 'kg' else val
+        m = re.search(r"(\d+\.?\d*)\s*oz\b", s)
+        if m and out["size_ml"] is None:
+            out["size_ml"] = float(m.group(1)) * 29.57
+        m = re.search(r"\b([a-z]{1,2}\d{2,4}|\d{2,4})\b", s)
+        if m:
+            out["shade"] = m.group(1)
+        m = re.search(r"\b([a-z]{2,3}-?\d{3,4}|iphone\s?\d{1,2}[a-z]?)\b", s)
+        if m:
+            out["model"] = m.group(1)
+        return out
+
+    def _compare_variants(self, a: dict, b: dict) -> Optional[float]:
+        if not a and not b:
+            return None
+        checks, score = 0, 0.0
+        def close(x, y, tol):
+            return x is not None and y is not None and abs(x - y) <= tol
+        if a.get('size_ml') or b.get('size_ml'):
+            checks += 1
+            if a.get('size_ml') and b.get('size_ml'):
+                score += 1.0 if close(a['size_ml'], b['size_ml'], 1.0) else 0.0
+        if a.get('weight_g') or b.get('weight_g'):
+            checks += 1
+            if a.get('weight_g') and b.get('weight_g'):
+                score += 1.0 if close(a['weight_g'], b['weight_g'], 1.0) else 0.0
+        if a.get('pack') or b.get('pack'):
+            checks += 1
+            if a.get('pack') and b.get('pack'):
+                score += 1.0 if a['pack'] == b['pack'] else 0.0
+        if a.get('shade') or b.get('shade'):
+            checks += 1
+            if a.get('shade') and b.get('shade'):
+                score += 1.0 if a['shade'] == b['shade'] else 0.0
+        if a.get('model') or b.get('model'):
+            checks += 1
+            if a.get('model') and b.get('model'):
+                score += 1.0 if a['model'] == b['model'] else 0.0
+        if checks == 0:
+            return None
+        if score > 0:
+            self.metrics["variant_hits"] += 1
+        return score / checks
 
 
 # Global instance for dependency injection

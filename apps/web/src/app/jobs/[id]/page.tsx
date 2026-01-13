@@ -15,7 +15,9 @@ import {
   GitCompareArrows,
   Percent,
   Clock,
-  Loader2
+  Loader2,
+  Settings,
+  Wand2
 } from 'lucide-react';
 import { api, type Job, type Match, type CSVUploadResponse } from '@/lib/api';
 import { formatRelativeTime } from '@/lib/utils';
@@ -70,6 +72,26 @@ export default function JobDetailsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [metrics, setMetrics] = useState<any>({});
+  // AI settings local state
+  const [aiEnabled, setAiEnabled] = useState(false);
+  const [aiMin, setAiMin] = useState(0.7);
+  const [aiMax, setAiMax] = useState(0.9);
+  const [aiCap, setAiCap] = useState(100);
+  // Quick match state
+  const [qmTitle, setQmTitle] = useState('');
+  const [qmUrl, setQmUrl] = useState('');
+  const [qmBrand, setQmBrand] = useState('');
+  const [qmCategory, setQmCategory] = useState('');
+  const [qmPrice, setQmPrice] = useState('');
+  const [qmResults, setQmResults] = useState<any | null>(null);
+  const [qmLoading, setQmLoading] = useState(false);
+  // Text matching settings
+  const [embedEnriched, setEmbedEnriched] = useState(false);
+  const [tokenNormV2, setTokenNormV2] = useState(false);
+  const [useBrandOnto, setUseBrandOnto] = useState(false);
+  const [useCategoryOnto, setUseCategoryOnto] = useState(false);
+  const [useVariant, setUseVariant] = useState(false);
 
   useEffect(() => {
     fetchJobData();
@@ -93,7 +115,29 @@ export default function JobDetailsPage() {
       ]);
 
       setJob(jobData);
+      // Initialize AI settings from config if exists
+      const cfg: any = (jobData as any).config || {};
+      if (typeof cfg.ai_validation_enabled === 'boolean') setAiEnabled(cfg.ai_validation_enabled);
+      if (typeof cfg.ai_validation_min === 'number') setAiMin(cfg.ai_validation_min);
+      if (typeof cfg.ai_validation_max === 'number') setAiMax(cfg.ai_validation_max);
+      if (typeof cfg.ai_validation_cap === 'number') setAiCap(cfg.ai_validation_cap);
+      if (typeof cfg.embed_enriched_text === 'boolean') setEmbedEnriched(cfg.embed_enriched_text);
+      if (typeof cfg.token_norm_v2 === 'boolean') setTokenNormV2(cfg.token_norm_v2);
+      if (typeof cfg.use_brand_ontology === 'boolean') setUseBrandOnto(cfg.use_brand_ontology);
+      if (typeof cfg.use_category_ontology === 'boolean') setUseCategoryOnto(cfg.use_category_ontology);
+      if (typeof cfg.use_variant_extractor === 'boolean') setUseVariant(cfg.use_variant_extractor);
       setMatches(matchesData);
+      // Fetch persisted matcher metrics
+      try {
+        const base = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+        const res = await fetch(`${base}/api/jobs/${jobId}/metrics`);
+        if (res.ok) {
+          const m = await res.json();
+          setMetrics(m || {});
+        }
+      } catch (e) {
+        // Ignore metrics errors
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load job details');
     } finally {
@@ -342,6 +386,29 @@ export default function JobDetailsPage() {
             </div>
           </div>
 
+          {/* Matcher Metrics */}
+          <div className="glass-card p-6">
+            <h2 className="text-lg font-semibold text-[rgb(var(--text-primary))] mb-4">Matcher Metrics</h2>
+            <div className="space-y-2 text-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-[rgb(var(--text-muted))]">Brand alias hits</span>
+                <span className="font-mono">{metrics.alias_hits ?? 0}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-[rgb(var(--text-muted))]">Category synonym hits</span>
+                <span className="font-mono">{metrics.synonym_hits ?? 0}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-[rgb(var(--text-muted))]">Variant hits</span>
+                <span className="font-mono">{metrics.variant_hits ?? 0}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-[rgb(var(--text-muted))]">Image OCR comparisons</span>
+                <span className="font-mono">{metrics.image_comparisons ?? 0}</span>
+              </div>
+            </div>
+          </div>
+
           {/* Actions */}
           <div className="glass-card p-6">
             <h2 className="text-lg font-semibold text-[rgb(var(--text-primary))] mb-4">
@@ -369,6 +436,52 @@ export default function JobDetailsPage() {
                 Refresh
               </button>
 
+              <a
+                href={`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/jobs/${jobId}/export`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-secondary w-full flex items-center justify-center gap-2"
+              >
+                {/* Using a simple label to avoid extra icon import churn */}
+                Export CSV
+              </a>
+
+              <a
+                href={`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/jobs/${jobId}/diagnostics?sample_size=50`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-secondary w-full flex items-center justify-center gap-2"
+              >
+                Diagnostics CSV
+              </a>
+
+              <button
+                onClick={async () => {
+                  try {
+                    const base = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+                    const res = await fetch(`${base}/api/jobs/${jobId}`, {
+                      method: 'PUT',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        config: {
+                          ai_validation_enabled: true,
+                          ai_validation_min: 0.70,
+                          ai_validation_max: 0.90,
+                          ai_validation_cap: 100,
+                        },
+                      }),
+                    });
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    alert('AI Validation enabled for this job');
+                  } catch (e) {
+                    alert('Failed to enable AI Validation');
+                  }
+                }}
+                className="btn-secondary w-full flex items-center justify-center gap-2"
+              >
+                Enable AI Validation
+              </button>
+
               <button
                 onClick={handleDeleteJob}
                 className="btn-danger w-full flex items-center justify-center gap-2"
@@ -378,7 +491,188 @@ export default function JobDetailsPage() {
               </button>
             </div>
           </div>
+
+          {/* AI Validation Settings */}
+          <div className="glass-card p-6">
+            <div className="flex items-center gap-2 mb-4">
+              <Settings className="w-4 h-4 text-[rgb(var(--accent))]" />
+              <h2 className="text-lg font-semibold text-[rgb(var(--text-primary))]">AI Validation</h2>
+            </div>
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-[rgb(var(--text-secondary))]">Enable AI validation</span>
+                <input type="checkbox" checked={aiEnabled} onChange={(e) => setAiEnabled(e.target.checked)} />
+              </div>
+              {aiEnabled && (
+                <div className="grid grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-xs text-[rgb(var(--text-muted))]">Min</label>
+                    <input type="number" min={0} max={1} step={0.01} value={aiMin}
+                      onChange={(e) => setAiMin(parseFloat(e.target.value || '0'))} className="input-field" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-[rgb(var(--text-muted))]">Max</label>
+                    <input type="number" min={0} max={1} step={0.01} value={aiMax}
+                      onChange={(e) => setAiMax(parseFloat(e.target.value || '0'))} className="input-field" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-[rgb(var(--text-muted))]">Cap</label>
+                    <input type="number" min={0} step={1} value={aiCap}
+                      onChange={(e) => setAiCap(parseInt(e.target.value || '0', 10))} className="input-field" />
+                  </div>
+                </div>
+              )}
+              <button
+                onClick={async () => {
+                  try {
+                    await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/jobs/${jobId}`, {
+                      method: 'PUT',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        config: {
+                          ai_validation_enabled: aiEnabled,
+                          ai_validation_min: aiMin,
+                          ai_validation_max: aiMax,
+                          ai_validation_cap: aiCap,
+                        },
+                      }),
+                    });
+                    alert('AI settings saved');
+                  } catch (e) {
+                    alert('Failed to save AI settings');
+                  }
+                }}
+                className="btn-primary w-full"
+              >
+                Save AI Settings
+              </button>
+            </div>
+          </div>
+
+          {/* Text Matching Settings */}
+          <div className="glass-card p-6">
+            <div className="mb-4 text-lg font-semibold text-[rgb(var(--text-primary))]">Text Matching</div>
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-[rgb(var(--text-secondary))]">Embed Enriched Text</span>
+                <input type="checkbox" checked={embedEnriched} onChange={(e) => setEmbedEnriched(e.target.checked)} />
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-[rgb(var(--text-secondary))]">Improved Token Normalization (v2)</span>
+                <input type="checkbox" checked={tokenNormV2} onChange={(e) => setTokenNormV2(e.target.checked)} />
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-[rgb(var(--text-secondary))]">Use Brand Ontology</span>
+                <input type="checkbox" checked={useBrandOnto} onChange={(e) => setUseBrandOnto(e.target.checked)} />
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-[rgb(var(--text-secondary))]">Use Category Ontology</span>
+                <input type="checkbox" checked={useCategoryOnto} onChange={(e) => setUseCategoryOnto(e.target.checked)} />
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-[rgb(var(--text-secondary))]">Variant Extractor (size/shade/model)</span>
+                <input type="checkbox" checked={useVariant} onChange={(e) => setUseVariant(e.target.checked)} />
+              </div>
+              <button
+                onClick={async () => {
+                  try {
+                    await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/jobs/${jobId}`, {
+                      method: 'PUT',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        config: {
+                          embed_enriched_text: embedEnriched,
+                          token_norm_v2: tokenNormV2,
+                          use_brand_ontology: useBrandOnto,
+                          use_category_ontology: useCategoryOnto,
+                          use_variant_extractor: useVariant,
+                        },
+                      }),
+                    });
+                    alert('Text matching settings saved');
+                  } catch (e) {
+                    alert('Failed to save settings');
+                  }
+                }}
+                className="btn-primary w-full"
+              >
+                Save Text Settings
+              </button>
+            </div>
+          </div>
         </div>
+      </div>
+
+      {/* Quick Match (No Persistence) */}
+      <div className="glass-card p-6">
+        <div className="flex items-center gap-2 mb-4">
+          <Wand2 className="w-4 h-4 text-[rgb(var(--accent))]" />
+          <h2 className="text-lg font-semibold text-[rgb(var(--text-primary))]">Quick Match (No Persistence)</h2>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+          <input className="input-field md:col-span-2" placeholder="Title (required)" value={qmTitle} onChange={(e) => setQmTitle(e.target.value)} />
+          <input className="input-field" placeholder="Brand" value={qmBrand} onChange={(e) => setQmBrand(e.target.value)} />
+          <input className="input-field" placeholder="Category" value={qmCategory} onChange={(e) => setQmCategory(e.target.value)} />
+          <input className="input-field" placeholder="Price" value={qmPrice} onChange={(e) => setQmPrice(e.target.value)} />
+          <input className="input-field md:col-span-5" placeholder="URL (optional)" value={qmUrl} onChange={(e) => setQmUrl(e.target.value)} />
+        </div>
+        <div className="mt-3 flex items-center gap-3">
+          <button
+            onClick={async () => {
+              if (!qmTitle) return alert('Title is required');
+              setQmLoading(true);
+              setQmResults(null);
+              try {
+                const base = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+                const resp = await fetch(`${base}/api/match/quick`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    job_id: jobId,
+                    title: qmTitle,
+                    url: qmUrl || undefined,
+                    brand: qmBrand || undefined,
+                    category: qmCategory || undefined,
+                    price: qmPrice ? parseFloat(qmPrice) : undefined,
+                  })
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                setQmResults(data);
+              } catch (e) {
+                alert('Quick match failed');
+              } finally {
+                setQmLoading(false);
+              }
+            }}
+            className="btn-secondary"
+          >
+            {qmLoading ? 'Matching…' : 'Run Quick Match'}
+          </button>
+          <button onClick={() => { setQmResults(null); }} className="btn-secondary">Clear</button>
+        </div>
+        {qmResults && (
+          <div className="mt-4">
+            {qmResults.best_match && (
+              <div className="mb-3 p-3 rounded border border-[rgba(var(--border),var(--border-opacity))]">
+                <div className="text-sm text-[rgb(var(--text-muted))] mb-1">Best Match</div>
+                <div className="font-medium">{qmResults.best_match.title}</div>
+                <div className="text-xs">Score: {(qmResults.best_match.score * 100).toFixed(1)}% • Tier: {qmResults.best_match.confidence_tier}</div>
+                <a href={qmResults.best_match.url} target="_blank" className="text-xs text-[rgb(var(--accent))]">{qmResults.best_match.url}</a>
+              </div>
+            )}
+            <div className="text-sm text-[rgb(var(--text-secondary))] mb-2">Top 5 Candidates</div>
+            <div className="space-y-2">
+              {qmResults.top_5?.map((c: any) => (
+                <div key={c.product_id} className="p-3 rounded bg-[rgba(var(--surface-0),0.5)] border border-[rgba(var(--border),var(--border-opacity))]">
+                  <div className="font-medium">{c.title}</div>
+                  <div className="text-xs">Score: {(c.score * 100).toFixed(1)}% • Tier: {c.confidence_tier}</div>
+                  <a href={c.url} target="_blank" className="text-xs text-[rgb(var(--accent))]">{c.url}</a>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Matches Section */}

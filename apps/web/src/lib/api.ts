@@ -16,6 +16,7 @@ interface ApiJob {
   created_at: string;
   started_at?: string;
   completed_at?: string;
+  config?: any;
 }
 
 // Frontend-friendly Job interface
@@ -32,6 +33,7 @@ export interface Job {
   progress?: number;
   created_at: string;
   updated_at?: string;
+  config?: any;
 }
 
 // Transform API response to frontend format
@@ -48,6 +50,7 @@ function transformApiJob(apiJob: ApiJob): Job {
     matched_products: apiJob.total_matches || 0,
     created_at: apiJob.created_at,
     updated_at: apiJob.completed_at || apiJob.started_at || apiJob.created_at,
+    config: apiJob.config || {},
   };
 }
 
@@ -57,6 +60,16 @@ export interface CreateJobRequest {
   site2_url: string;
   site1_category?: string;
   site2_category?: string;
+  ai_validation_enabled?: boolean;
+  ai_validation_min?: number;
+  ai_validation_max?: number;
+  ai_validation_cap?: number;
+  embed_enriched_text?: boolean;
+  token_norm_v2?: boolean;
+  use_brand_ontology?: boolean;
+  use_category_ontology?: boolean;
+  use_variant_extractor?: boolean;
+  use_ocr_text?: boolean;
 }
 
 // Transform frontend field names to API field names
@@ -65,6 +78,7 @@ interface ApiCreateJobRequest {
   site_a_url: string;
   site_b_url: string;
   categories?: string[];
+  config?: any;
 }
 
 export interface Match {
@@ -132,12 +146,34 @@ export const api = {
         site_a_url: data.site1_url,
         site_b_url: data.site2_url,
         categories: categories.length > 0 ? categories : undefined,
+        config: {
+          ai_validation_enabled: data.ai_validation_enabled ?? false,
+          ai_validation_min: data.ai_validation_min ?? 0.70,
+          ai_validation_max: data.ai_validation_max ?? 0.90,
+          ai_validation_cap: data.ai_validation_cap ?? 100,
+          embed_enriched_text: data.embed_enriched_text ?? false,
+          token_norm_v2: data.token_norm_v2 ?? false,
+          use_brand_ontology: data.use_brand_ontology ?? false,
+          use_category_ontology: data.use_category_ontology ?? false,
+          use_variant_extractor: data.use_variant_extractor ?? false,
+          use_ocr_text: data.use_ocr_text ?? false,
+        },
       };
 
       const response = await fetch(`${API_URL}/api/jobs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(apiData),
+      });
+      const apiJob: ApiJob = await handleResponse(response);
+      return transformApiJob(apiJob);
+    },
+
+    update: async (id: string, update: { name?: string; categories?: string[]; config?: any }): Promise<Job> => {
+      const response = await fetch(`${API_URL}/api/jobs/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(update),
       });
       const apiJob: ApiJob = await handleResponse(response);
       return transformApiJob(apiJob);

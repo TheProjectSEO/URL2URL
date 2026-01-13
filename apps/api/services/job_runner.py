@@ -8,15 +8,17 @@ through all stages of the matching pipeline.
 
 import asyncio
 import logging
+import json
 from datetime import datetime
 from typing import Optional, Callable, Dict, Any
 from uuid import UUID
 
-from models.schemas import JobStatus, Site, Product
+from models.schemas import JobStatus, Site, Product, MatchStatus, ConfidenceTier
 from services.supabase import get_supabase_service
 from services.matcher_v2 import get_matcher_v2_service, MatchResult
 from services.crawler import ProductCrawler
 from services.progress import ProgressTracker, ProgressStage, create_progress_tracker
+from services.matcher_v2 import MatcherConfig, get_matcher_v2_service
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +124,43 @@ class JobRunner:
                 job_id, Site.SITE_B
             )
 
+            # 3.5 Configure matcher from job config (AI validation toggle & cap)
+            try:
+                cfg = job.config if isinstance(job.config, dict) else {}
+                ai_enabled = bool(cfg.get('ai_validation_enabled', False))
+                ai_min = float(cfg.get('ai_validation_min', 0.70))
+                ai_max = float(cfg.get('ai_validation_max', 0.90))
+                ai_cap = int(cfg.get('ai_validation_cap', 100))
+                embed_enriched = bool(cfg.get('embed_enriched_text', False))
+                token_norm_v2 = bool(cfg.get('token_norm_v2', False))
+                use_brand_onto = bool(cfg.get('use_brand_ontology', False))
+                use_category_onto = bool(cfg.get('use_category_ontology', False))
+                use_variant = bool(cfg.get('use_variant_extractor', False))
+                use_ocr_text = bool(cfg.get('use_ocr_text', False))
+                ocr_cap = int(cfg.get('ocr_max_comparisons', 500))
+            except Exception:
+                ai_enabled, ai_min, ai_max, ai_cap = False, 0.70, 0.90, 100
+                embed_enriched, token_norm_v2 = False, False
+                use_brand_onto, use_category_onto, use_variant = False, False, False
+                use_ocr_text, ocr_cap = False, 500
+
+            matcher_config = MatcherConfig(
+                enable_ai_validation=ai_enabled,
+                ai_validation_min_score=ai_min,
+                ai_validation_max_score=ai_max,
+                max_ai_validations_per_job=ai_cap,
+                enable_image_matching=use_ocr_text,
+                embed_enriched_text=embed_enriched,
+                token_norm_v2=token_norm_v2,
+                use_brand_ontology=use_brand_onto,
+                use_category_ontology=use_category_onto,
+                use_variant_extractor=use_variant,
+                use_ocr_text=use_ocr_text,
+                max_image_comparisons_per_job=ocr_cap
+            )
+            # Reset singleton with config for this job
+            self.matcher = get_matcher_v2_service(config=matcher_config, reset=True)
+
             # 4. Generate and store Site B embeddings
             await tracker.start_stage(
                 ProgressStage.GENERATING_EMBEDDINGS,
@@ -139,7 +178,18 @@ class JobRunner:
 
             await tracker.update_progress(
                 stored_count,
-                f"Generated {stored_count} embeddings",
+                json.dumps({
+                    "text": f"Generated {stored_count} embeddings",
+                    "counters": {
+                        "processed": 0,
+                        "matched": 0,
+                        "high_confidence": 0,
+                        "no_match": 0,
+                        "needs_review": 0,
+                        "embedding_failed": max(len(site_b_products) - stored_count, 0),
+                        "image_text_comparisons": 0
+                    }
+                }),
                 force=True
             )
             await tracker.complete_stage("Embeddings generated")
@@ -157,11 +207,30 @@ class JobRunner:
             results: list[MatchResult] = []
             logger.info(f"Matching {len(site_a_products)} products")
 
+            # Live counters
+            matched_count = 0
+            high_confidence = 0
+            no_match_count = 0
+            needs_review_count = 0
+            embedding_failed = max(len(site_b_products) - stored_count, 0)
+            image_text_comparisons = 0
+
             for i, source in enumerate(site_a_products):
                 # Update progress
                 await tracker.update_progress(
                     i + 1,
-                    f"Matching product {i + 1}/{len(site_a_products)}: {source.title[:50]}..."
+                    json.dumps({
+                        "text": f"Matching product {i + 1}/{len(site_a_products)}: {source.title[:50]}...",
+                        "counters": {
+                            "processed": i + 1,
+                            "matched": matched_count,
+                            "high_confidence": high_confidence,
+                            "no_match": no_match_count,
+                            "needs_review": needs_review_count,
+                            "embedding_failed": embedding_failed,
+                            "image_text_comparisons": image_text_comparisons
+                        }
+                    })
                 )
 
                 if on_progress:
@@ -169,15 +238,45 @@ class JobRunner:
 
                 result = await self.matcher.match_product(source, job_id)
                 results.append(result)
+                # Update image comparisons counter from matcher metrics
+                try:
+                    image_text_comparisons = int(self.matcher.metrics.get("image_comparisons", image_text_comparisons))
+                except Exception:
+                    pass
 
                 # 6. Store match result
                 await self._store_match_result(job_id, result)
+
+                # Update counters
+                if result.is_no_match:
+                    no_match_count += 1
+                    needs_review_count += 1
+                else:
+                    matched_count += 1
+                    # Confidence buckets
+                    if result.confidence_tier in (ConfidenceTier.EXACT_MATCH, ConfidenceTier.HIGH_CONFIDENCE):
+                        high_confidence += 1
+                    elif result.confidence_tier in (ConfidenceTier.LIKELY_MATCH, ConfidenceTier.MANUAL_REVIEW):
+                        needs_review_count += 1
 
                 # Log progress every 10 products
                 if (i + 1) % 10 == 0:
                     logger.info(f"Matched {i + 1}/{len(site_a_products)} products")
 
-            await tracker.complete_stage("Matching complete")
+            await tracker.complete_stage(
+                json.dumps({
+                    "text": "Matching complete",
+                    "counters": {
+                        "processed": len(site_a_products),
+                        "matched": matched_count,
+                        "high_confidence": high_confidence,
+                        "no_match": no_match_count,
+                        "needs_review": needs_review_count,
+                        "embedding_failed": embedding_failed,
+                        "image_text_comparisons": image_text_comparisons
+                    }
+                })
+            )
 
             # 7. Update status to COMPLETED
             await self.supabase.update_job_status(
@@ -207,6 +306,18 @@ class JobRunner:
             )
 
             logger.info(f"Job {job_id} completed: {stats}")
+
+            # Persist matcher metrics into job.config for observability
+            try:
+                metrics = self.matcher.get_matching_metrics() if hasattr(self.matcher, 'get_matching_metrics') else {}
+                # Merge with existing job config
+                job_after = await self.supabase.get_job(job_id)
+                base_cfg = job_after.config if isinstance(job_after.config, dict) else {}
+                base_cfg['metrics'] = metrics
+                await self.supabase.update_job(job_id, CrawlJobUpdate(config=JobConfig().model_validate(base_cfg)))
+            except Exception as e:
+                logger.warning(f"Failed to persist matcher metrics for job {job_id}: {e}")
+
             return stats
 
         except Exception as e:
@@ -326,7 +437,7 @@ class JobRunner:
                 for c in result.top_5_candidates
             ]
 
-            self.supabase.client.rpc('store_match_with_candidates', {
+            rpc_result = self.supabase.client.rpc('store_match_with_candidates', {
                 'p_job_id': str(job_id),
                 'p_source_product_id': str(result.source_product.id),
                 'p_matched_product_id': str(result.best_match.product_id) if result.best_match else None,
@@ -337,6 +448,34 @@ class JobRunner:
                 'p_is_no_match': result.is_no_match,
                 'p_no_match_reason': result.no_match_reason or None
             }).execute()
+
+            # Auto-approve >= 0.90, auto-reject < 0.50
+            try:
+                data = rpc_result.data
+                # Handle both list and single row
+                match_row = None
+                if isinstance(data, list) and data:
+                    match_row = data[0]
+                elif isinstance(data, dict):
+                    match_row = data
+
+                if match_row and match_row.get('id'):
+                    match_id = match_row['id']
+                    new_status: MatchStatus | None = None
+                    if result.is_no_match or result.confidence_tier == ConfidenceTier.NO_MATCH:
+                        new_status = MatchStatus.REJECTED
+                    elif (
+                        result.confidence_tier in (ConfidenceTier.EXACT_MATCH, ConfidenceTier.HIGH_CONFIDENCE)
+                    ):
+                        new_status = MatchStatus.APPROVED
+
+                    if new_status is not None:
+                        self.supabase.client.rpc('url_update_match_status', {
+                            'p_match_id': str(match_id),
+                            'p_status': new_status.value
+                        }).execute()
+            except Exception as e:
+                logger.warning(f"Failed to apply auto-status for match: {e}")
 
         except Exception as e:
             logger.error(f"Failed to store match result: {e}")

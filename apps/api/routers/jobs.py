@@ -9,6 +9,7 @@ from typing import Optional, List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from models.schemas import (
@@ -20,8 +21,8 @@ from models.schemas import (
     PaginatedResponse, JobStatistics, ErrorResponse
 )
 from services.supabase import SupabaseService, get_supabase_service
-from services.matcher import MatcherService, get_matcher_service
-from services.job_runner import run_job_background
+from services.job_runner import run_job_background, JobRunner
+from services.matcher_v2 import get_matcher_v2_service, MatcherConfig
 
 logger = logging.getLogger(__name__)
 
@@ -199,8 +200,7 @@ async def run_job(
     job_id: UUID,
     request: RunJobRequest,
     background_tasks: BackgroundTasks,
-    db: SupabaseService = Depends(get_supabase_service),
-    matcher: MatcherService = Depends(get_matcher_service)
+    db: SupabaseService = Depends(get_supabase_service)
 ):
     """
     Run product matching for a job.
@@ -233,7 +233,7 @@ async def run_job(
         )
 
         try:
-            # Create products in database
+            # Create products in database (provided lists)
             logger.info(f"Creating {len(request.site_a_products)} Site A products...")
             products_a_to_create = [
                 ProductCreate(
@@ -244,11 +244,10 @@ async def run_job(
                     brand=p.brand,
                     category=p.category,
                     price=p.price,
-                    metadata=p.metadata
-                )
-                for p in request.site_a_products
+                    metadata=p.metadata or {}
+                ) for p in request.site_a_products
             ]
-            created_products_a = await db.create_products_bulk(products_a_to_create)
+            await db.create_products_bulk(products_a_to_create)
 
             logger.info(f"Creating {len(request.site_b_products)} Site B products...")
             products_b_to_create = [
@@ -260,55 +259,30 @@ async def run_job(
                     brand=p.brand,
                     category=p.category,
                     price=p.price,
-                    metadata=p.metadata
-                )
-                for p in request.site_b_products
+                    metadata=p.metadata or {}
+                ) for p in request.site_b_products
             ]
-            created_products_b = await db.create_products_bulk(products_b_to_create)
+            await db.create_products_bulk(products_b_to_create)
 
-            # Run matching
-            logger.info("Running product matching...")
-            match_results, stats = matcher.match_products(
-                request.site_a_products,
-                request.site_b_products,
-                job_id=job_id
-            )
+            # Run the full pipeline synchronously using JobRunner (no crawling if not pending)
+            runner = JobRunner()
+            stats = await runner.run_job(job_id)
 
-            # Save matches to database
-            logger.info(f"Saving {len(match_results)} matches to database...")
-            matches_to_create = [
-                MatchCreate(
-                    job_id=job_id,
-                    source_product_id=created_products_a[r.source_index].id,
-                    matched_product_id=created_products_b[r.target_index].id,
-                    score=r.score,
-                    confidence_tier=r.confidence_tier,
-                    explanation=r.explanation
-                )
-                for r in match_results
-            ]
-            await db.create_matches_bulk(matches_to_create)
-
-            # Update job status to completed
-            await db.update_job_status(
-                job_id,
-                JobStatus.COMPLETED,
-                completed_at=datetime.utcnow()
-            )
-
-            logger.info(f"Job {job_id} completed successfully")
+            total_products = stats.get("total_products", 0)
+            high_conf = stats.get("high_confidence", 0)
+            no_match = stats.get("no_match", 0)
+            needs_review = max(total_products - high_conf - no_match, 0)
 
             return RunJobResponse(
                 job_id=job_id,
                 status=JobStatus.COMPLETED,
                 message="Matching completed successfully",
-                total_matches=stats["total_matches"],
-                high_confidence=stats["high_confidence_count"],
-                needs_review=stats["needs_review_count"]
+                total_matches=stats.get("matches_found", 0),
+                high_confidence=high_conf,
+                needs_review=needs_review
             )
 
         except Exception as e:
-            # Update job status to failed
             await db.update_job_status(job_id, JobStatus.FAILED)
             logger.error(f"Job {job_id} failed: {e}")
             raise HTTPException(status_code=500, detail=f"Matching failed: {str(e)}")
@@ -398,17 +372,16 @@ async def get_job_matches(
         )
 
         # Transform to response format
+        # Note: RPC returns flat columns (source_url, source_title, matched_url, matched_title)
+        # not nested objects
         items = []
         for m in matches_data:
-            source = m.get("source_product", {})
-            target = m.get("matched_product", {})
-
             items.append(MatchResponse(
                 id=UUID(m["id"]),
-                source_url=source.get("url", ""),
-                source_title=source.get("title", ""),
-                best_match_url=target.get("url", ""),
-                best_match_title=target.get("title", ""),
+                source_url=m.get("source_url", ""),
+                source_title=m.get("source_title", ""),
+                matched_url=m.get("matched_url", ""),
+                matched_title=m.get("matched_title", ""),
                 score=float(m["score"]),
                 confidence_tier=ConfidenceTier(m["confidence_tier"]),
                 explanation=m.get("explanation"),
@@ -527,3 +500,176 @@ async def get_job_progress(
         "eta_seconds": progress.eta_seconds,
         "message": progress.message
     }
+
+
+# =============================================================================
+# Export Matches CSV
+# =============================================================================
+
+@router.get("/{job_id}/export")
+async def export_job_matches_csv(
+    job_id: UUID,
+    db: SupabaseService = Depends(get_supabase_service),
+    page_size: int = Query(1000, ge=1, le=5000)
+):
+    """
+    Download matches for a job as CSV.
+
+    Columns: source_url, source_title, matched_url, matched_title, score, confidence_tier, explanation, status
+    """
+    import csv
+    import io
+
+    job = await db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Stream all matches in pages
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "source_url", "source_title", "matched_url", "matched_title",
+        "score", "confidence_tier", "explanation", "status"
+    ])
+
+    offset = 0
+    total_written = 0
+    while True:
+        matches_data, total = await db.get_matches_by_job(
+            job_id=job_id,
+            limit=page_size,
+            offset=offset
+        )
+        if not matches_data:
+            break
+        for m in matches_data:
+            writer.writerow([
+                m.get("source_url", ""),
+                m.get("source_title", ""),
+                m.get("matched_url", ""),
+                m.get("matched_title", ""),
+                f"{float(m.get('score', 0)):.4f}",
+                m.get("confidence_tier", ""),
+                (m.get("explanation") or "").replace("\n", " ").strip(),
+                m.get("status", "")
+            ])
+            total_written += 1
+        offset += page_size
+        if offset >= total:
+            break
+
+    output.seek(0)
+    filename = f"job_{job_id}_matches.csv"
+    headers = {
+        "Content-Disposition": f"attachment; filename={filename}"
+    }
+    return StreamingResponse(output, media_type="text/csv", headers=headers)
+
+
+# =============================================================================
+# Diagnostics Export (component scores for a sample of matches)
+# =============================================================================
+
+@router.get("/{job_id}/diagnostics")
+async def export_diagnostics(
+    job_id: UUID,
+    sample_size: int = Query(50, ge=1, le=500),
+    db: SupabaseService = Depends(get_supabase_service)
+):
+    """
+    Export a CSV with component scores (semantic/token/attr/visual) for a sample of matches.
+    Recomputes components using current matcher config for the job.
+    """
+    import csv, io
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    job = await db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Configure matcher like the runner does
+    cfg = job.config if isinstance(job.config, dict) else {}
+    matcher = get_matcher_v2_service(config=MatcherConfig(
+        enable_ai_validation=bool(cfg.get('ai_validation_enabled', False)),
+        ai_validation_min_score=float(cfg.get('ai_validation_min', 0.70)),
+        ai_validation_max_score=float(cfg.get('ai_validation_max', 0.90)),
+        max_ai_validations_per_job=int(cfg.get('ai_validation_cap', 100)),
+        enable_image_matching=bool(cfg.get('use_ocr_text', False)),
+        embed_enriched_text=bool(cfg.get('embed_enriched_text', False)),
+        token_norm_v2=bool(cfg.get('token_norm_v2', False)),
+        use_brand_ontology=bool(cfg.get('use_brand_ontology', False)),
+        use_category_ontology=bool(cfg.get('use_category_ontology', False)),
+        use_variant_extractor=bool(cfg.get('use_variant_extractor', False)),
+    ), reset=True)
+
+    # Fetch a page of matches
+    matches_data, total = await db.get_matches_by_job(job_id=job_id, limit=sample_size, offset=0)
+    if not matches_data:
+        raise HTTPException(status_code=404, detail="No matches for diagnostics")
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        'source_title','target_title','final_score','semantic','token','attributes','visual','brand_src','brand_tgt','category_src','category_tgt'
+    ])
+
+    for m in matches_data:
+        source = await db.get_product(UUID(m['source_product_id']))
+        target = await db.get_product(UUID(m['matched_product_id'])) if m.get('matched_product_id') else None
+        if not source or not target:
+            continue
+
+        # Compose texts and embeddings
+        src_text = matcher._compose_text(source)
+        tgt_text = matcher._compose_text(target)
+        src_emb = matcher.generate_embedding(src_text)
+        tgt_emb = matcher.generate_embedding(tgt_text)
+        sem = float(cosine_similarity([src_emb], [tgt_emb])[0][0])
+
+        # Token overlap
+        st = matcher._tokenize_text(source.title)
+        tt = matcher._tokenize_text(target.title)
+        inter = len(st & tt)
+        uni = len(st | tt)
+        tok = (inter / uni) if uni else 0.0
+
+        # Attributes (0..1)
+        attr = matcher._attribute_match(source, target)
+
+        # Visual not recomputed here (set blank)
+        visual = ''
+
+        # Final using current weights (no visual)
+        final = sem * matcher.SEMANTIC_WEIGHT + tok * matcher.TOKEN_WEIGHT + attr * matcher.ATTRIBUTE_WEIGHT
+
+        writer.writerow([
+            source.title,
+            target.title,
+            f"{final:.4f}",
+            f"{sem:.4f}",
+            f"{tok:.4f}",
+            f"{attr:.4f}",
+            visual,
+            source.brand or '',
+            target.brand or '',
+            source.category or '',
+            target.category or ''
+        ])
+
+    output.seek(0)
+    headers = {"Content-Disposition": f"attachment; filename=diagnostics_{job_id}.csv"}
+    return StreamingResponse(output, media_type="text/csv", headers=headers)
+
+
+@router.get("/{job_id}/metrics")
+async def get_job_metrics(job_id: UUID, db: SupabaseService = Depends(get_supabase_service)):
+    """
+    Return persisted matcher metrics for a job (if available).
+    Metrics are stored in job.config.metrics at the end of a run.
+    """
+    job = await db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    cfg = job.config if isinstance(job.config, dict) else {}
+    return cfg.get('metrics', {})

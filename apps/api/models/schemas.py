@@ -70,6 +70,20 @@ class JobConfig(BaseModel):
     top_k: int = Field(default=25, ge=1, le=100, description="Number of candidates to consider")
     model_name: str = Field(default="sentence-transformers/all-MiniLM-L6-v2")
     batch_size: int = Field(default=32, ge=1, le=128)
+    ai_validation_enabled: bool = Field(default=False, description="Enable AI validation for borderline matches")
+    ai_validation_min: float = Field(default=0.70, ge=0.0, le=1.0)
+    ai_validation_max: float = Field(default=0.90, ge=0.0, le=1.0)
+    ai_validation_cap: int = Field(default=100, ge=0)
+    # Text matching enhancements
+    embed_enriched_text: bool = Field(default=False, description="Embed title+brand+category for better semantics")
+    token_norm_v2: bool = Field(default=False, description="Use improved token normalization for overlap scoring")
+    # Ontologies & variants
+    use_brand_ontology: bool = Field(default=False, description="Canonicalize brand via alias mapping")
+    use_category_ontology: bool = Field(default=False, description="Use category synonyms/related mapping")
+    use_variant_extractor: bool = Field(default=False, description="Parse and compare size/shade/model variants")
+    # OCR image text signal
+    use_ocr_text: bool = Field(default=False, description="Use OCR text from product images as visual signal")
+    ocr_max_comparisons: int = Field(default=500, ge=0, description="Max image pairs to OCR per job")
 
 
 class CrawlJobBase(BaseModel):
@@ -185,8 +199,8 @@ class MatchResponse(BaseModel):
     id: UUID
     source_url: str
     source_title: str
-    best_match_url: str
-    best_match_title: str
+    matched_url: str  # Renamed from best_match_url to match frontend expectations
+    matched_title: str  # Renamed from best_match_title to match frontend expectations
     score: float
     confidence_tier: ConfidenceTier
     explanation: Optional[str] = None
@@ -310,3 +324,34 @@ class JobStatistics(BaseModel):
     median_score: float
     needs_review_count: int
     processing_time_seconds: Optional[float] = None
+
+
+# =============================================================================
+# Quick Match
+# =============================================================================
+
+class QuickMatchRequest(BaseModel):
+    job_id: UUID
+    title: str
+    url: Optional[str] = None
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    price: Optional[float] = None
+
+
+class QuickMatchCandidate(BaseModel):
+    product_id: UUID
+    title: str
+    url: str
+    score: float
+    brand: str
+    category: str
+    confidence_tier: ConfidenceTier
+
+
+class QuickMatchResponse(BaseModel):
+    best_match: Optional[QuickMatchCandidate] = None
+    top_5: List[QuickMatchCandidate]
+    confidence_tier: ConfidenceTier
+    explanation: Optional[str] = None
+    is_no_match: bool

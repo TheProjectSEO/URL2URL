@@ -121,22 +121,43 @@ function EmptyState() {
 }
 
 function ProductCell({ title, url }: { title: string; url: string }) {
+  // Safely extract hostname from URL
+  const getHostname = (urlString: string): string => {
+    if (!urlString) return 'Unknown';
+    try {
+      return new URL(urlString).hostname;
+    } catch {
+      // If URL is invalid, try to extract domain-like pattern or return truncated URL
+      const match = urlString.match(/(?:https?:\/\/)?(?:www\.)?([^\/\s]+)/);
+      return match?.[1] || urlString.slice(0, 30);
+    }
+  };
+
+  const hostname = getHostname(url);
+  const isValidUrl = url && (url.startsWith('http://') || url.startsWith('https://'));
+
   return (
     <div className="space-y-1.5">
       <p className="text-sm font-medium text-[rgb(var(--text-primary))] line-clamp-2 leading-snug">
-        {title}
+        {title || 'Untitled Product'}
       </p>
-      <a
-        href={url}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="inline-flex items-center gap-1 text-xs text-[rgb(var(--accent))] hover:text-[rgba(var(--accent),0.8)] transition-colors group"
-      >
-        <span className="font-mono truncate max-w-[180px] opacity-70 group-hover:opacity-100">
-          {new URL(url).hostname}
+      {isValidUrl ? (
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 text-xs text-[rgb(var(--accent))] hover:text-[rgba(var(--accent),0.8)] transition-colors group"
+        >
+          <span className="font-mono truncate max-w-[180px] opacity-70 group-hover:opacity-100">
+            {hostname}
+          </span>
+          <ExternalLink className="w-3 h-3 flex-shrink-0" />
+        </a>
+      ) : (
+        <span className="text-xs text-[rgb(var(--text-muted))] font-mono">
+          {hostname}
         </span>
-        <ExternalLink className="w-3 h-3 flex-shrink-0" />
-      </a>
+      )}
     </div>
   );
 }

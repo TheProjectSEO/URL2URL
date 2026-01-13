@@ -1,0 +1,9 @@
+{
+  "lipstick": ["lip color", "lip colour", "lipstick set", "lip crayon"],
+  "foundation": ["base makeup", "liquid foundation", "bb cream", "cc cream"],
+  "t-shirt": ["tee", "tshirt", "tees"],
+  "smartphone": ["mobile phone", "cell phone"],
+  "headphones": ["earphones", "earbuds", "headset"],
+  "laptop": ["notebook", "ultrabook"]
+}
+

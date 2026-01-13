@@ -6,7 +6,7 @@ Handles CSV file uploads for product URLs from both sites.
 import csv
 import io
 import logging
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
@@ -31,10 +31,11 @@ class CSVUploadResponse(BaseModel):
 class ProductURL(BaseModel):
     """Single product URL from CSV"""
     url: str
-    title: str = None
-    brand: str = None
-    category: str = None
-    price: float = None
+    title: Optional[str] = None
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    price: Optional[float] = None
+    image_url: Optional[str] = None
 
 
 @router.post("/products/{job_id}/{site}", response_model=CSVUploadResponse)
@@ -116,12 +117,20 @@ async def upload_products_csv(
             except ValueError:
                 pass  # Skip invalid prices silently
 
+        image_url = None
+        # Accept either image_url or image column names
+        for key in ('image_url', 'image', 'img'):
+            if key in row and row.get(key):
+                image_url = row.get(key).strip()
+                break
+
         products.append(ProductURL(
             url=url,
             title=row.get('title', '').strip() or None,
             brand=row.get('brand', '').strip() or None,
             category=row.get('category', '').strip() or None,
-            price=price
+            price=price,
+            image_url=image_url
         ))
 
     if not products:
@@ -136,6 +145,11 @@ async def upload_products_csv(
 
     for product_url in products:
         try:
+            # Build metadata, include image_url if provided
+            metadata = {"crawl_status": "pending" if not product_url.title else "provided"}
+            if product_url.image_url:
+                metadata["image_url"] = product_url.image_url
+
             await supabase.create_product(ProductCreate(
                 job_id=job_id,
                 site=Site(site),
@@ -144,7 +158,7 @@ async def upload_products_csv(
                 brand=product_url.brand,
                 category=product_url.category,
                 price=product_url.price,
-                metadata={"crawl_status": "pending" if not product_url.title else "provided"}
+                metadata=metadata
             ))
             uploaded += 1
         except Exception as e:
@@ -166,6 +180,6 @@ async def get_csv_template():
     return {
         "format": "CSV with headers",
         "required_columns": ["url"],
-        "optional_columns": ["title", "brand", "category", "price"],
-        "example": "url,title,brand,category,price\nhttps://nykaa.com/product/123,Maybelline Fit Me Foundation,Maybelline,Foundation,599\nhttps://nykaa.com/product/456,L'Oreal Paris Serum,L'Oreal,Serum,899"
+        "optional_columns": ["title", "brand", "category", "price", "image_url"],
+        "example": "url,title,brand,category,price,image_url\nhttps://site.com/p/123,Sample Product,Brand,Category,599,https://cdn.site.com/img/123.jpg\nhttps://site.com/p/456,Another Product,Brand,Category,899,https://cdn.site.com/img/456.jpg"
     }

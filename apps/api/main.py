@@ -12,6 +12,10 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -25,6 +29,7 @@ from routers.jobs import router as jobs_router
 from routers.matches import router as matches_router
 from routers.health import router as health_router
 from routers.upload import router as upload_router
+from routers.quick_match import router as quick_match_router
 
 # Configure logging
 logging.basicConfig(
@@ -208,6 +213,9 @@ app.include_router(matches_router)
 
 # CSV upload endpoints
 app.include_router(upload_router)
+
+# Quick match endpoint (no persistence)
+app.include_router(quick_match_router)
 
 
 # =============================================================================
