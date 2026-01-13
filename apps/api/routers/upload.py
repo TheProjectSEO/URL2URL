@@ -124,14 +124,29 @@ async def upload_products_csv(
                 image_url = row.get(key).strip()
                 break
 
-        products.append(ProductURL(
-            url=url,
-            title=row.get('title', '').strip() or None,
-            brand=row.get('brand', '').strip() or None,
-            category=row.get('category', '').strip() or None,
-            price=price,
-            image_url=image_url
-        ))
+        # Build product dict with only non-empty values
+        # This avoids Pydantic 2.x validation issues with explicit None values
+        product_data = {"url": url}
+
+        title_val = row.get('title', '').strip()
+        if title_val:
+            product_data["title"] = title_val
+
+        brand_val = row.get('brand', '').strip()
+        if brand_val:
+            product_data["brand"] = brand_val
+
+        category_val = row.get('category', '').strip()
+        if category_val:
+            product_data["category"] = category_val
+
+        if price is not None:
+            product_data["price"] = price
+
+        if image_url:
+            product_data["image_url"] = image_url
+
+        products.append(ProductURL(**product_data))
 
     if not products:
         raise HTTPException(
