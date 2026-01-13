@@ -58,6 +58,15 @@ class MatcherConfig:
     embed_enriched_text: bool = False
     token_norm_v2: bool = False
 
+    # Ontology and variant matching (Phase 6)
+    use_brand_ontology: bool = False
+    use_category_ontology: bool = False
+    use_variant_extractor: bool = False
+
+    # OCR/Image text matching
+    use_ocr_text: bool = False
+    max_image_comparisons_per_job: int = 500
+
 
 @dataclass
 class CandidateMatch:
